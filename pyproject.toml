@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "access-model-mkfigs"
+version = "0.1.0"
+description = "Evaluation figure workflow tools for ACCESS model paper repositories"
+readme = "README.md"
+authors = [
+  {name = "ACCESS-NRI and contributors", email = "chris.bull@anu.edu.au"}
+]
+maintainers = [
+  {name = "ACCESS-NRI and contributors", email = "chris.bull@anu.edu.au"}
+]
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+keywords = ["ACCESS", "ocean model", "figures", "Figshare", "mkdocs"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+  "pyyaml",
+  "requests",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "coverage",  # testing
+    "pytest",  # testing
+    "ruff"  # linting
+    ]
+
+[project.scripts]
+mkfigs-run     = "mkfigs.run:main"
+mkfigs-pushit  = "mkfigs.pushit:main"
+mkfigs-restore = "mkfigs.restore:main"
+
+[project.urls]
+bugs = "https://github.com/ACCESS-NRI/access-model-mkfigs/issues"
+changelog = "https://github.com/ACCESS-NRI/access-model-mkfigs/blob/main/HISTORY.rst"
+homepage = "https://github.com/ACCESS-NRI/access-model-mkfigs"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+"*" = ["*.*"]
+
+
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
+
+
+[tool.coverage.run]
+omit = [
+    "*/_version.py",
+    "*/data/__init__.py",
+]

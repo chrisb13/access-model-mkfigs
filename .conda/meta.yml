@@ -1,0 +1,44 @@
+
+{% set data = load_setup_py_data(setup_file='../setup.py', from_recipe_dir=True) %}
+{% set version = data.get('version') %}
+
+package:
+  name: access-nri-intake
+  version: "{{ version }}"
+
+source:
+  url: "https://pypi.io/packages/source/a/access-nri-intake/access_nri_intake-{{ version }}.tar.gz"
+
+build:
+  noarch: python
+  number: 0
+  script: "{{ PYTHON }} -m pip install . -vv"
+
+
+requirements:
+  host:
+    - python
+    - pip
+    - versioneer
+  run:
+    - python >=3.10
+    - pip>=24.0
+    - wheel==0.33.6
+    - watchdog==0.9.0
+    - tox>=4.0
+    - coverage>=7.0.0
+    - sphinx>=8.0
+    - twine>=6.0.0
+    - ruff>=0.9
+    - pytest==6.2.4
+    - pip:
+      - codecov
+
+about:
+  home: https://github.com/ACCESS-NRI/mkfigs
+  license: Apache Software License 2.0
+  summary: Evaluation figure workflow tools for ACCESS model paper repositories
+  doc_url: https://access-nri-intake-catalog.readthedocs.io/en/latest/
+
+extra:
+  recipe-maintainers:
