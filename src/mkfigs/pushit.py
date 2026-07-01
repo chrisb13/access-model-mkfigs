@@ -73,6 +73,41 @@ def _load_notebook_issues(notebooks_dir: Path) -> dict[str, str]:
     return getattr(mod, "ISSUES", {})
 
 
+def parse_mkfigs_sh() -> tuple[str, str, list[str]]:
+    """Parse ENAME, ESMDIR, and notebook list from mkfigs.sh."""
+    sh = HERE / "mkfigs.sh"
+    if not sh.exists():
+        sys.exit(f"ERROR: mkfigs.sh not found in {HERE}")
+    text = sh.read_text()
+
+    ename = esmdir = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        m = re.match(r"^ENAME=([^\s#]+)", stripped)
+        if m:
+            ename = m.group(1)
+        m = re.match(r"^ESMDIR=([^\s#]+)", stripped)
+        if m:
+            esmdir = m.group(1)
+
+    if not ename:
+        sys.exit("ERROR: could not find an uncommented ENAME= line in mkfigs.sh")
+    if not esmdir:
+        sys.exit("ERROR: could not find an uncommented ESMDIR= line in mkfigs.sh")
+
+    arr_match = re.search(r'\barray=\(\s*(.*?)\s*\)', text, re.DOTALL)
+    notebooks: list[str] = []
+    if arr_match:
+        for raw in arr_match.group(1).splitlines():
+            stripped = raw.strip()
+            if stripped and not stripped.startswith("#"):
+                notebooks.append(stripped)
+
+    return ename, esmdir, notebooks
+
+
 HERE = _find_notebooks_dir()
 REPO = HERE.parent
 DOCS_PAGES = REPO / "documentation" / "docs" / "pages"
@@ -123,6 +158,7 @@ def build_run_summary(
     prev_committed_nbs: list[str],
     run_time: datetime,
     notebook_issues: dict[str, str] | None = None,
+    existing_run_times: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Return (plain_text_summary, markdown_summary).
 
@@ -161,12 +197,27 @@ def build_run_summary(
         + [f"| `{nb}` | ✅ Previously committed | {notebook_issues.get(nb, '')} | [Summary Figures]({exp_dir}/{nb}.md) · [Full Notebook]({exp_dir}/notebooks/{nb}/) |"
            for nb in prev_committed_nbs]
     )
+    # Group notebooks by run time when there are both newly run and previously committed.
+    if ok_nbs and prev_committed_nbs:
+        _nb_times: dict[str, str] = {nb: ts for nb in ok_nbs}
+        for nb in prev_committed_nbs:
+            _nb_times[nb] = (existing_run_times or {}).get(nb, "previously committed")
+        _by_time: dict[str, list[str]] = {}
+        for nb, t in _nb_times.items():
+            _by_time.setdefault(t, []).append(nb)
+        run_time_md = "- **Run time:**\n" + "\n".join(
+            f"  - {t}: {', '.join('`' + nb + '`' for nb in sorted(nbs))}"
+            for t, nbs in sorted(_by_time.items(), reverse=True)
+        ) + "\n"
+    else:
+        run_time_md = f"- **Run time:** {ts}\n"
+
     md = (
         "| Notebook | Status | GitHub Issue(s) | Links |\n"
         "|---|---|---|---|\n"
         + "\n".join(md_rows)
         + f"\n\n- **ESM datastore:** `{esmdir}`\n"
-        f"- **Run time:** {ts}\n"
+        + run_time_md
     )
 
     return plain, md
@@ -297,7 +348,8 @@ def check_figshare_upload_mode(ename: str) -> None:
     urls_json = experiment_docs_dir / "notebooks_urls.json"
     if urls_json.exists():
         for nb_name, url in json.loads(urls_json.read_text()).items():
-            _add(f"notebook  {nb_name}", url)
+            if not nb_name.startswith("_"):
+                _add(f"notebook  {nb_name}", url)
     else:
         print(f"WARNING: {urls_json} not found — run mkfigs-pushit first.")
 
@@ -318,7 +370,7 @@ def check_figshare_upload_mode(ename: str) -> None:
     if not all_ok:
         print("\n*** Some URLs are not accessible — is the Figshare article published? ***")
         print("Publish it, then re-run:")
-        print("  mkfigs-pushit --check-figshare-upload")
+        print(f"  mkfigs-pushit --check-figshare-upload --ename {ename}")
         sys.exit(1)
 
     print("\nAll Figshare URLs are publicly accessible.\n")
@@ -654,11 +706,42 @@ def main() -> None:
     print()
 
     # -----------------------------------------------------------------------
+    # Supplement notebook list from output folder when --ename is passed
+    # (picks up notebooks run previously that aren't in mkfigs.sh array).
+    # -----------------------------------------------------------------------
+    if args.ename and ofol.exists():
+        suffix = "_rendered.ipynb"
+        extra = sorted(
+            p.name[: -len(suffix)]
+            for p in ofol.glob("*_rendered.ipynb")
+            if p.name[: -len(suffix)] not in notebooks
+        )
+        notebooks = notebooks + extra
+
+    # -----------------------------------------------------------------------
+    # Load previously committed URLs before notebook classification so we can
+    # detect restored notebooks (in existing_urls but no new PNGs this run).
+    # -----------------------------------------------------------------------
+    experiment_docs_dir = DOCS_PAGES / "experiments" / ename
+    urls_json_path = experiment_docs_dir / "notebooks_urls.json"
+    urls_json_rel  = f"documentation/docs/pages/experiments/{ename}/notebooks_urls.json"
+    existing_urls: dict[str, str] = {}
+    existing_run_times: dict[str, str] = {}
+    if urls_json_path.exists():
+        try:
+            _d = json.loads(urls_json_path.read_text())
+            existing_run_times = _d.pop("_run_times", {})
+            existing_urls = {k: v for k, v in _d.items() if not k.startswith("_")}
+        except Exception as exc:
+            print(f"WARNING: could not read existing {urls_json_path}: {exc}")
+
+    # -----------------------------------------------------------------------
     # Check each notebook
     # -----------------------------------------------------------------------
-    ok_nbs:      list[str] = []
-    failed_nbs:  list[str] = []
-    not_run_nbs: list[str] = []
+    ok_nbs:             list[str] = []
+    failed_nbs:         list[str] = []
+    not_run_nbs:        list[str] = []
+    prev_committed_nbs: list[str] = []
 
     for nb in notebooks:
         rendered = ofol / f"{nb}_rendered.ipynb"
@@ -667,6 +750,11 @@ def main() -> None:
         if not rendered.exists():
             not_run_nbs.append(nb)
             status = "NOT RUN"
+        elif nb in existing_urls and not pngs:
+            # Restored by mkfigs-restore (rendered notebook + md present but
+            # no new PNGs): preserve existing Figshare URL, do not re-upload.
+            prev_committed_nbs.append(nb)
+            status = "PREV COMMITTED"
         elif not pngs and not nb_md.exists():
             failed_nbs.append(nb)
             status = "FAILED  (no PNGs or markdown)"
@@ -676,24 +764,18 @@ def main() -> None:
             status = f"OK      ({n_png} PNG{'s' if n_png != 1 else ''})"
         print(f"  {status:<34}  {nb}")
 
-    # Load previously committed notebook URLs to merge with this run's results.
-    experiment_docs_dir = DOCS_PAGES / "experiments" / ename
-    urls_json_path = experiment_docs_dir / "notebooks_urls.json"
-    urls_json_rel  = f"documentation/docs/pages/experiments/{ename}/notebooks_urls.json"
-    existing_urls: dict[str, str] = {}
-    if not args.dry_run and urls_json_path.exists():
-        try:
-            existing_urls = json.loads(urls_json_path.read_text())
-        except Exception as exc:
-            print(f"WARNING: could not read existing {urls_json_path}: {exc}")
-    # Notebooks committed in a previous run not being re-run (or replaced) now.
-    prev_committed_nbs = [nb for nb in existing_urls if nb not in ok_nbs]
+    # Any previously committed notebooks absent from this run's notebook list.
+    _seen = {*ok_nbs, *failed_nbs, *not_run_nbs, *prev_committed_nbs}
+    for nb in existing_urls:
+        if nb not in _seen:
+            prev_committed_nbs.append(nb)
 
     print()
     notebook_issues = _load_notebook_issues(HERE)
     plain_summary, md_summary = build_run_summary(
         ename, esmdir, ok_nbs, failed_nbs, not_run_nbs, prev_committed_nbs, run_time,
         notebook_issues=notebook_issues,
+        existing_run_times=existing_run_times,
     )
     print(plain_summary)
 
@@ -727,6 +809,11 @@ def main() -> None:
 
     # Merge: new-run URLs take priority over previously committed.
     all_notebook_urls = {**existing_urls, **notebook_urls}
+    # Track per-notebook run times for future runs to display in the summary.
+    _ts = run_time.strftime("%Y-%m-%d %H:%M UTC")
+    _merged_run_times = {**existing_run_times, **{nb: _ts for nb in ok_nbs}}
+    if _merged_run_times:
+        all_notebook_urls["_run_times"] = _merged_run_times
     # Nav includes all notebooks with valid URLs, except those that failed this run.
     failed_set = set(failed_nbs)
     all_nav_nbs = ok_nbs + [nb for nb in prev_committed_nbs if nb not in failed_set]
@@ -809,7 +896,8 @@ def main() -> None:
     print("Next steps:")
     print("  1. Go to Figshare and PUBLISH the article so all URLs become public.")
     print("  2. Verify and get git commands by running:")
-    print("       mkfigs-pushit --check-figshare-upload")
+    _ename_flag = f" --ename {ename}" if args.ename else ""
+    print(f"       mkfigs-pushit --check-figshare-upload{_ename_flag}")
     print()
 
 
