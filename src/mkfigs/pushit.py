@@ -38,6 +38,8 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 
 import yaml
+from importlib.metadata import distribution as _pkg_distribution
+from importlib.metadata import version as _pkg_version
 from .configdoc import figshare_upload_and_rewrite
 
 
@@ -159,6 +161,8 @@ def build_run_summary(
     run_time: datetime,
     notebook_issues: dict[str, str] | None = None,
     existing_run_times: dict[str, str] | None = None,
+    mkfigs_version: str = "unknown",
+    existing_run_versions: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Return (plain_text_summary, markdown_summary).
 
@@ -197,26 +201,31 @@ def build_run_summary(
         + [f"| `{nb}` | ✅ Previously committed | {notebook_issues.get(nb, '')} | [Summary Figures]({exp_dir}/{nb}.md) · [Full Notebook]({exp_dir}/notebooks/{nb}/) |"
            for nb in prev_committed_nbs]
     )
-    # Group notebooks by run time when there are both newly run and previously committed.
-    if ok_nbs and prev_committed_nbs:
-        _nb_times: dict[str, str] = {nb: ts for nb in ok_nbs}
-        for nb in prev_committed_nbs:
-            _nb_times[nb] = (existing_run_times or {}).get(nb, "previously committed")
-        _by_time: dict[str, list[str]] = {}
-        for nb, t in _nb_times.items():
-            _by_time.setdefault(t, []).append(nb)
-        run_time_md = "- **Run time:**\n" + "\n".join(
-            f"  - {t}: {', '.join('`' + nb + '`' for nb in sorted(nbs))}"
-            for t, nbs in sorted(_by_time.items(), reverse=True)
+    # Build per-notebook (date, version) lookup then group into table rows.
+    _nb_times: dict[str, str] = {nb: ts for nb in ok_nbs}
+    _nb_versions: dict[str, str] = {nb: mkfigs_version for nb in ok_nbs}
+    for nb in prev_committed_nbs:
+        _nb_times[nb] = (existing_run_times or {}).get(nb, "previously committed")
+        _nb_versions[nb] = (existing_run_versions or {}).get(nb, "—")
+
+    _by_run: dict[tuple[str, str], list[str]] = {}
+    for nb in ok_nbs + prev_committed_nbs:
+        _by_run.setdefault((_nb_times[nb], _nb_versions[nb]), []).append(nb)
+
+    run_time_md = (
+        "| Date | Notebooks run | access-model-mkfigs |\n"
+        "|---|---|---|\n"
+        + "\n".join(
+            f"| {t} | {', '.join('`' + nb + '`' for nb in sorted(nbs))} | {v} |"
+            for (t, v), nbs in sorted(_by_run.items(), reverse=True)
         ) + "\n"
-    else:
-        run_time_md = f"- **Run time:** {ts}\n"
+    )
 
     md = (
         "| Notebook | Status | GitHub Issue(s) | Links |\n"
         "|---|---|---|---|\n"
         + "\n".join(md_rows)
-        + f"\n\n- **ESM datastore:** `{esmdir}`\n"
+        + f"\n\n- **ESM datastore:** `{esmdir}`\n\n"
         + run_time_md
     )
 
@@ -705,6 +714,18 @@ def main() -> None:
                    help="Verify all Figshare URLs are public, then print git commands")
     args = p.parse_args()
 
+    try:
+        _ver = _pkg_version("access-model-mkfigs")
+        _commit = ""
+        try:
+            _direct = json.loads(_pkg_distribution("access-model-mkfigs").read_text("direct_url.json"))
+            _commit = _direct.get("vcs_info", {}).get("commit_id", "")[:7]
+        except Exception:
+            pass
+        mkfigs_version = f"{_ver}+{_commit}" if _commit else _ver
+    except Exception:
+        mkfigs_version = "unknown"
+
     ename, esmdir, notebooks = parse_mkfigs_sh()
     if args.ename:
         ename = args.ename
@@ -749,10 +770,12 @@ def main() -> None:
     urls_json_rel  = f"documentation/docs/pages/experiments/{ename}/notebooks_urls.json"
     existing_urls: dict[str, str] = {}
     existing_run_times: dict[str, str] = {}
+    existing_run_versions: dict[str, str] = {}
     if urls_json_path.exists():
         try:
             _d = json.loads(urls_json_path.read_text())
             existing_run_times = _d.pop("_run_times", {})
+            existing_run_versions = _d.pop("_run_versions", {})
             existing_urls = {k: v for k, v in _d.items() if not k.startswith("_")}
         except Exception as exc:
             print(f"WARNING: could not read existing {urls_json_path}: {exc}")
@@ -798,6 +821,8 @@ def main() -> None:
         ename, esmdir, ok_nbs, failed_nbs, not_run_nbs, prev_committed_nbs, run_time,
         notebook_issues=notebook_issues,
         existing_run_times=existing_run_times,
+        mkfigs_version=mkfigs_version,
+        existing_run_versions=existing_run_versions,
     )
     print(plain_summary)
 
@@ -831,11 +856,14 @@ def main() -> None:
 
     # Merge: new-run URLs take priority over previously committed.
     all_notebook_urls = {**existing_urls, **notebook_urls}
-    # Track per-notebook run times for future runs to display in the summary.
+    # Track per-notebook run times and package versions for future summary display.
     _ts = run_time.strftime("%Y-%m-%d %H:%M UTC")
     _merged_run_times = {**existing_run_times, **{nb: _ts for nb in ok_nbs}}
     if _merged_run_times:
         all_notebook_urls["_run_times"] = _merged_run_times
+    _merged_run_versions = {**existing_run_versions, **{nb: mkfigs_version for nb in ok_nbs}}
+    if _merged_run_versions:
+        all_notebook_urls["_run_versions"] = _merged_run_versions
     # Nav includes all notebooks with valid URLs, except those that failed this run.
     failed_set = set(failed_nbs)
     all_nav_nbs = ok_nbs + [nb for nb in prev_committed_nbs if nb not in failed_set]

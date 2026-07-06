@@ -23,6 +23,8 @@ import os
 import re
 import subprocess
 import sys
+from importlib.metadata import distribution as _pkg_distribution
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 
@@ -136,10 +138,23 @@ def main() -> None:
 
     log = setup_logging(mdfol / "mkfigs_run.log")
 
-    log.info("Experiment : %s", ename)
-    log.info("ESMDIR     : %s", esmdir)
-    log.info("Output dir : %s", ofol)
-    log.info("Log file   : %s", mdfol / "mkfigs_run.log")
+    try:
+        _ver = _pkg_version("access-model-mkfigs")
+        _commit = ""
+        try:
+            _direct = json.loads(_pkg_distribution("access-model-mkfigs").read_text("direct_url.json"))
+            _commit = _direct.get("vcs_info", {}).get("commit_id", "")[:7]
+        except Exception:
+            pass
+        mkfigs_ver = f"{_ver}+{_commit}" if _commit else _ver
+    except Exception:
+        mkfigs_ver = "unknown"
+
+    log.info("Experiment            : %s", ename)
+    log.info("ESMDIR                : %s", esmdir)
+    log.info("Output dir            : %s", ofol)
+    log.info("Log file              : %s", mdfol / "mkfigs_run.log")
+    log.info("access-model-mkfigs   : %s", mkfigs_ver)
 
     notebooks_env = os.environ.get("MKFIGS_NOTEBOOKS", "")
     if not notebooks_env:
