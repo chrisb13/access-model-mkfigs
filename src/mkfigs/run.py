@@ -20,9 +20,28 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _extract_notebook_error(rendered_path: Path) -> str | None:
+    """Return the last error cell output from a rendered notebook, ANSI-stripped."""
+    try:
+        with open(rendered_path) as f:
+            nb = json.load(f)
+        for cell in reversed(nb.get("cells", [])):
+            for output in cell.get("outputs", []):
+                if output.get("output_type") == "error":
+                    ename = output.get("ename", "")
+                    evalue = output.get("evalue", "")
+                    tb = "\n".join(output.get("traceback", []))
+                    tb = re.sub(r'\x1b\[[0-9;]*m', '', tb)
+                    return f"{ename}: {evalue}\n{tb}"
+    except Exception:
+        pass
+    return None
 
 
 def _fix_kernel(nb_path: Path) -> None:
@@ -156,7 +175,17 @@ def main() -> None:
         log.info("Succeeded (%d): %s", len(succeeded), ", ".join(succeeded))
     if failed:
         log.error("FAILED    (%d): %s", len(failed), ", ".join(failed))
-        log.error("Check the PBS error log and rendered notebooks for details.")
+        errors_log = mdfol / "mkfigs_errors.log"
+        with open(errors_log, "w") as ef:
+            for nb in failed:
+                rendered = ofol / f"{nb}_rendered.ipynb"
+                ef.write(f"{'=' * 56}\n")
+                ef.write(f"FAILED: {nb}\n")
+                ef.write(f"{'=' * 56}\n")
+                error = _extract_notebook_error(rendered)
+                ef.write(error + "\n" if error else "(no error output found in rendered notebook)\n")
+                ef.write("\n")
+        log.error("Error details: %s", errors_log)
 
     print()
     print("Next step — on a login node with conda/analysis3 loaded:")

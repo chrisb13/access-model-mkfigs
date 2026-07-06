@@ -238,6 +238,25 @@ def resolve_figshare_token() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Figshare helpers
+# ---------------------------------------------------------------------------
+
+def _get_figshare_article_url(mdfol: Path, ename: str) -> str | None:
+    """Return the Figshare article URL for this experiment from the manifest, or None."""
+    manifest = mdfol / "figshare_manifest.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text())
+        art_id = data.get(f"article_id_{ename}")
+        if art_id:
+            return f"https://figshare.com/articles/figure/{art_id}"
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Figshare upload (per notebook: PNGs + rendered notebook with outputs)
 # ---------------------------------------------------------------------------
 def upload_figshare_for_notebook(
@@ -289,12 +308,9 @@ def upload_figshare_for_notebook(
     else:
         print("[figshare] No files uploaded (nothing new or no PNGs found).")
 
-    manifest = mdfol / "figshare_manifest.json"
-    if manifest.exists():
-        data = json.loads(manifest.read_text())
-        art_id = data.get(f"article_id_{ename}")
-        if art_id:
-            print(f"[figshare] Article: https://figshare.com/articles/figure/{art_id}")
+    article_url = _get_figshare_article_url(mdfol, ename)
+    if article_url:
+        print(f"[figshare] Article: {article_url}")
 
     return url_map.get("_notebook")
 
@@ -584,6 +600,7 @@ def update_top_index(
     not_run_nbs: list[str],
     run_summary_md: str,
     authors_md: str,
+    figshare_url: str | None = None,
     dry_run: bool = False,
 ) -> None:
     """Append or replace an experiment block in the top-level pages/index.md.
@@ -635,9 +652,14 @@ def update_top_index(
 
     block_start = f"<!-- experiment:{ename} -->"
     block_end   = f"<!-- /experiment:{ename} -->"
+    figshare_line = (
+        f"**Figshare article:** [{figshare_url}]({figshare_url})\n\n"
+        if figshare_url else ""
+    )
     block = (
         f"{block_start}\n\n"
         f"## Analysis run summary {ename}\n\n"
+        + figshare_line
         + run_summary_md + "\n"
         + incomplete_block
         + f"{block_end}\n"
@@ -879,6 +901,7 @@ def main() -> None:
         not_run_nbs=not_run_nbs,
         run_summary_md=md_summary,
         authors_md=authors_md,
+        figshare_url=_get_figshare_article_url(mdfol, ename),
         dry_run=args.dry_run,
     )
 
