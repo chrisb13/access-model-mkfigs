@@ -202,9 +202,28 @@ def main() -> None:
                 ef.write("\n")
         log.error("Error details: %s", errors_log)
 
+    venv = notebooks_dir / f"mkfigs_output_{ename}" / "venv"
+    sep = "=" * 56
     print()
-    print("Next step — on a login node with conda/analysis3 loaded:")
-    print("  mkfigs-pushit")
+    print(sep)
+    print("Run complete — next steps on a login node:")
+    print(sep)
+    print()
+    print("  # 1. Load the environment and activate the venv")
+    print("  module purge")
+    print("  module use /g/data/xp65/public/modules")
+    print("  module load conda/analysis3")
+    print(f"  source {venv}/bin/activate")
+    print()
+    print("  # 2. Dry-run first to review what will be committed")
+    print(f"  mkfigs-pushit --ename {ename} --dry-run")
+    print()
+    print("  # 3. Push figures to Figshare and prepare the git commit")
+    print(f"  mkfigs-pushit --ename {ename}")
+    print()
+    print("  # 4. Log in to Figshare and publish the article, then verify")
+    print(f"  mkfigs-pushit --ename {ename} --check-figshare-upload")
+    print(sep)
     print()
 
 
