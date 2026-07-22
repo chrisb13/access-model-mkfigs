@@ -410,7 +410,7 @@ def check_figshare_upload_mode(ename: str) -> None:
     ]
 
     today = date.today()
-    tag = f"docs-{ename}-{today.strftime('%Y.%m')}.000"
+    tag = f"{ename}-{today.strftime('%Y.%m')}.000"
     rtd_slug = re.sub(r'[^a-z0-9-]+', '-', tag.lower()).strip('-')
     rtd_url  = f"https://access-om3-paper-1.readthedocs.io/en/{rtd_slug}/"
     tag_msg  = f"Evaluation figures for {ename}. Rendered site (after RTD builds tag): {rtd_url}"
