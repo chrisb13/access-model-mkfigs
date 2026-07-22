@@ -46,21 +46,26 @@ def _extract_notebook_error(rendered_path: Path) -> str | None:
     return None
 
 
-def _fix_kernel(nb_path: Path) -> None:
+def _fix_kernel(nb_path: Path) -> Path:
     """Normalise the notebook kernel to 'python3' so papermill can execute it.
 
     Notebooks opened interactively in ARE may have a kernel name like
     'conda-env-analysis3-25.07-py' that does not exist on the command line.
-    This rewrites the kernelspec metadata in-place before papermill runs.
+    This writes the kernel-fixed notebook to a private, PID-suffixed copy
+    next to nb_path and returns that path — nb_path itself is never
+    modified. Concurrent mkfigs-run jobs (e.g. multiple experiments queued
+    at once, all reading the same shared notebooks/<name>.ipynb template)
+    used to race on an in-place tmp.replace(nb_path) of that shared file;
+    writing a private copy per run removes the shared mutable state.
     """
     with open(nb_path) as f:
         d = json.load(f)
     d["metadata"]["kernelspec"]["display_name"] = "Python 3 (ipykernel)"
     d["metadata"]["kernelspec"]["name"] = "python3"
-    tmp = nb_path.with_suffix(".tmp.ipynb")
-    with open(tmp, "w") as f:
+    fixed = nb_path.with_name(f"{nb_path.stem}.kernel-fixed.{os.getpid()}.ipynb")
+    with open(fixed, "w") as f:
         json.dump(d, f)
-    tmp.replace(nb_path)
+    return fixed
 
 
 def _check_nci_environment() -> None:
@@ -104,19 +109,23 @@ def setup_logging(log_file: Path) -> logging.Logger:
 def run_notebook(nb: str, esmdir: str, ofol: Path, notebooks_dir: Path) -> bool:
     """Strip outputs, run via papermill, convert to markdown. Returns True on success."""
     nb_path = notebooks_dir / f"{nb}.ipynb"
-    _fix_kernel(nb_path)
+    fixed_path = _fix_kernel(nb_path)
 
-    rendered = str(ofol / f"{nb}_rendered.ipynb")
-    result = subprocess.run(
-        [
-            "papermill", str(nb_path), rendered,
-            "-p", "esm_file", esmdir,
-            "-p", "papermill", "True",
-            "-p", "cwd", str(ofol) + "/",
-            "-p", "nbname", f"{nb}.ipynb",
-        ],
-        cwd=str(notebooks_dir),
-    )
+    try:
+        rendered = str(ofol / f"{nb}_rendered.ipynb")
+        result = subprocess.run(
+            [
+                "papermill", str(fixed_path), rendered,
+                "-p", "esm_file", esmdir,
+                "-p", "papermill", "True",
+                "-p", "cwd", str(ofol) + "/",
+                "-p", "nbname", f"{nb}.ipynb",
+            ],
+            cwd=str(notebooks_dir),
+        )
+    finally:
+        fixed_path.unlink(missing_ok=True)
+
     subprocess.run(
         ["jupyter", "nbconvert", "--to", "markdown", rendered],
         check=False,
