@@ -103,8 +103,10 @@ def parse_mkfigs_sh() -> tuple[str, str, list[str]]:
     notebooks: list[str] = []
     if arr_match:
         for raw in arr_match.group(1).splitlines():
-            stripped = raw.strip()
-            if stripped and not stripped.startswith("#"):
+            # Strip inline '# comment' text too (e.g. "SeaIce_Vol  #needs 26.07"),
+            # matching how bash itself treats '#' after whitespace in the array.
+            stripped = raw.split("#", 1)[0].strip()
+            if stripped:
                 notebooks.append(stripped)
 
     return ename, esmdir, notebooks
