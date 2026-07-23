@@ -38,8 +38,8 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 
 import yaml
-from importlib.metadata import distribution as _pkg_distribution
-from importlib.metadata import version as _pkg_version
+
+from . import get_mkfigs_version
 from .configdoc import figshare_upload_and_rewrite
 
 
@@ -723,17 +723,7 @@ def main() -> None:
                    help="Verify all Figshare URLs are public, then print git commands")
     args = p.parse_args()
 
-    try:
-        _ver = _pkg_version("access-model-mkfigs")
-        _commit = ""
-        try:
-            _direct = json.loads(_pkg_distribution("access-model-mkfigs").read_text("direct_url.json"))
-            _commit = _direct.get("vcs_info", {}).get("commit_id", "")[:7]
-        except Exception:
-            pass
-        mkfigs_version = f"{_ver}+{_commit}" if _commit else _ver
-    except Exception:
-        mkfigs_version = "unknown"
+    mkfigs_version = get_mkfigs_version()
 
     ename, esmdir, notebooks = parse_mkfigs_sh()
     if args.ename:
