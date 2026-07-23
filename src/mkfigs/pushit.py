@@ -109,6 +109,13 @@ def parse_mkfigs_sh() -> tuple[str, str, list[str]]:
             if stripped:
                 notebooks.append(stripped)
 
+    # mkfigs.sh templates sometimes write ESMDIR=.../${ENAME}/datastore.json so a
+    # new experiment block can be added by just uncommenting an ENAME= line above
+    # it. Bash resolves that at run time; this regex parser doesn't, so without
+    # this substitution the literal "${ENAME}" (or "$ENAME") ends up in ESMDIR
+    # instead of the actual experiment path.
+    esmdir = esmdir.replace("${ENAME}", ename).replace("$ENAME", ename)
+
     return ename, esmdir, notebooks
 
 
