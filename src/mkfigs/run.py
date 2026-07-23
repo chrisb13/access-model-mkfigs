@@ -23,9 +23,9 @@ import os
 import re
 import subprocess
 import sys
-from importlib.metadata import distribution as _pkg_distribution
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
+
+from . import get_mkfigs_version
 
 
 def _extract_notebook_error(rendered_path: Path) -> str | None:
@@ -147,17 +147,7 @@ def main() -> None:
 
     log = setup_logging(mdfol / "mkfigs_run.log")
 
-    try:
-        _ver = _pkg_version("access-model-mkfigs")
-        _commit = ""
-        try:
-            _direct = json.loads(_pkg_distribution("access-model-mkfigs").read_text("direct_url.json"))
-            _commit = _direct.get("vcs_info", {}).get("commit_id", "")[:7]
-        except Exception:
-            pass
-        mkfigs_ver = f"{_ver}+{_commit}" if _commit else _ver
-    except Exception:
-        mkfigs_ver = "unknown"
+    mkfigs_ver = get_mkfigs_version()
 
     log.info("Experiment            : %s", ename)
     log.info("ESMDIR                : %s", esmdir)
