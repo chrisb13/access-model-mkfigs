@@ -29,6 +29,9 @@ dependencies = [
   "pyyaml",
   "requests",
   "matplotlib",
+  "papermill",
+  "nbconvert",
+  "nci_ipynb",
 ]
 
 [project.optional-dependencies]
