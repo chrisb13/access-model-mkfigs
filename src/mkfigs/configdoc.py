@@ -286,7 +286,13 @@ class FigshareUploader:
             info = _figshare_request("GET", upload_url, self.token)
             for p in info.get("parts", []):
                 if p.get("partNo") == part_no:
-                    return p.get("status") == "COMPLETE"
+                    status = p.get("status")
+                    print(f"[figshare]   [diag] part {part_no} status check: "
+                          f"{status!r}")
+                    return status == "COMPLETE"
+            print(f"[figshare]   [diag] part {part_no} not found in "
+                  f"upload_url parts list ({len(info.get('parts', []))} "
+                  f"parts returned)")
         except Exception as exc:
             print(f"[figshare]   WARNING: could not verify status of part "
                   f"{part_no} ({exc}); assuming it is not complete")
