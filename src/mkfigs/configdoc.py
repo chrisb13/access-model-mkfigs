@@ -4,6 +4,8 @@
 import hashlib
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -105,6 +107,48 @@ class FigshareUploader:
     # Article management
     # ------------------------------------------------------------------
 
+    def _search_articles_by_title(self, title):
+        """Find private articles matching *title* via Figshare's search endpoint.
+
+        POST /account/articles/search avoids the pagination trap of a plain
+        GET account/articles (which defaults to page_size=10, most-recent-
+        first — silently missing older articles once 10+ newer ones exist
+        in the account). Figshare's search may not be a strict equality
+        match, so callers must still filter results by exact title.
+
+        Returns None if the search call itself fails, so the caller can
+        fall back to exhaustive pagination.
+        """
+        url = FIGSHARE_BASE_URL.format(endpoint="account/articles/search")
+        try:
+            return _figshare_request(
+                "POST", url, self.token, data={"search_for": f":title: {title}"}
+            )
+        except Exception as exc:
+            print(f"[figshare]   WARNING: articles/search failed ({exc}), "
+                  f"falling back to full pagination")
+            return None
+
+    def _list_all_articles_paginated(self, page_size=100):
+        """Exhaustively page through GET account/articles.
+
+        Fallback for when the search endpoint is unavailable or unreliable.
+        Loops until a page comes back with fewer than page_size results,
+        rather than trusting page 1 alone (which is all the previous
+        unpaginated call ever looked at).
+        """
+        base_url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
+        all_articles = []
+        page = 1
+        while True:
+            url = f"{base_url}?page={page}&page_size={page_size}"
+            batch = _figshare_request("GET", url, self.token)
+            all_articles.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
+        return all_articles
+
     def _get_or_create_article(self):
         """Return the article_id for this experiment, creating if needed."""
         key = f"article_id_{self.experiment}"
@@ -113,10 +157,15 @@ class FigshareUploader:
             print(f"[figshare] Reusing existing article {article_id} for {self.experiment}")
             return article_id
 
-        # Search private articles for an existing one with the same title
-        url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
-        existing = _figshare_request("GET", url, self.token)
-        for art in existing:
+        # Search private articles for an existing one with the same title.
+        # Prefer the dedicated search endpoint (doesn't require knowing how
+        # many articles exist); fall back to exhaustive pagination if the
+        # search call fails for any reason.
+        candidates = self._search_articles_by_title(self.article_title)
+        if candidates is None:
+            candidates = self._list_all_articles_paginated()
+
+        for art in candidates:
             if art.get("title") == self.article_title:
                 article_id = art["id"]
                 print(f"[figshare] Found existing article {article_id} by title search")
@@ -125,6 +174,7 @@ class FigshareUploader:
                 return article_id
 
         # Create a new private article
+        url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
         data = {
             "title": self.article_title,
             "description": (
@@ -147,69 +197,276 @@ class FigshareUploader:
     # File upload
     # ------------------------------------------------------------------
 
-    def _upload_file(self, article_id, file_path):
-        """Upload a single file and return its public download_url."""
-        fname = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
-        file_md5 = _md5(file_path)
-
-        # Check manifest for a previously uploaded version of the same file
-        manifest_key = f"file_{fname}"
-        if manifest_key in self._manifest:
-            cached = self._manifest[manifest_key]
-            if cached.get("md5") == file_md5:
-                print(f"[figshare] Skipping {fname} (already uploaded, MD5 matches)")
-                return cached["download_url"]
-            else:
-                print(f"[figshare] MD5 changed for {fname}, re-uploading")
-
-        # Step 1 – initiate upload
+    def _list_remote_files(self, article_id):
+        """Return the list of file dicts currently attached to *article_id*."""
         url = FIGSHARE_BASE_URL.format(
             endpoint=f"account/articles/{article_id}/files"
         )
-        data = {"name": fname, "size": file_size, "md5": file_md5}
-        resp = _figshare_request("POST", url, self.token, data=data)
-        file_url = resp["location"]  # e.g. .../articles/<id>/files/<file_id>
-        file_id = int(file_url.split("/")[-1])
+        return _figshare_request("GET", url, self.token)
 
-        # Step 2 – get upload token + parts info
-        file_info = _figshare_request("GET", file_url, self.token)
-        upload_url = file_info["upload_url"]
-        parts_info = _figshare_request("GET", upload_url, self.token)
+    def _find_remote_file(self, article_id, fname):
+        """Return the remote file dict named *fname* on *article_id*, or None."""
+        for f in self._list_remote_files(article_id):
+            if f.get("name") == fname:
+                return f
+        return None
 
-        # Step 3 – upload parts
-        with open(file_path, "rb") as fh:
-            for part in parts_info["parts"]:
-                part_no = part["partNo"]
-                start = part["startOffset"]
-                end = part["endOffset"] + 1
-                fh.seek(start)
-                chunk = fh.read(end - start)
-                part_url = f"{upload_url}/{part_no}"
-                requests.put(
-                    part_url,
-                    headers=_figshare_headers(self.token),
-                    data=chunk,
-                ).raise_for_status()
-                print(f"[figshare]   Uploaded part {part_no} of {fname}")
-
-        # Step 4 – complete upload
-        complete_url = FIGSHARE_BASE_URL.format(
+    def _delete_remote_file(self, article_id, file_id):
+        """Delete a stale/mismatched/incomplete remote file entry."""
+        url = FIGSHARE_BASE_URL.format(
             endpoint=f"account/articles/{article_id}/files/{file_id}"
         )
-        _figshare_request("POST", complete_url, self.token)
-        print(f"[figshare] Completed upload of {fname}")
+        _figshare_request("DELETE", url, self.token)
+        print(f"[figshare]   Deleted stale remote file (id {file_id})")
 
-        # Retrieve public download URL
-        file_details = _figshare_request("GET", complete_url, self.token)
-        download_url = file_details.get(
-            "download_url",
-            f"https://figshare.com/articles/figure/{article_id}",
-        )
+    def _reconcile_remote_file(self, article_id, fname, file_md5):
+        """Check Figshare's actual state for *fname* before uploading anything.
 
-        # Cache in manifest
-        self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
-        self._save_manifest()
+        Remote state (not the local manifest) is treated as the source of
+        truth, since the manifest can go stale if a previous run was killed
+        before it got a chance to save. Returns one of:
+
+        ("reuse", download_url)       – identical file already fully uploaded;
+                                         nothing to send.
+        ("resume", file_id, upload_url) – an incomplete upload for the *same*
+                                         content already exists; continue it
+                                         rather than starting over.
+        ("fresh", None, None)         – no usable remote entry; do a normal
+                                         initiate-upload from scratch.
+        """
+        existing = self._find_remote_file(article_id, fname)
+        if existing is None:
+            return ("fresh", None, None)
+
+        file_id = existing["id"]
+        computed_md5 = existing.get("computed_md5")
+
+        if computed_md5:
+            # Figshare only populates computed_md5 once a file has fully
+            # finished uploading, so this branch means "complete on remote".
+            if computed_md5 == file_md5:
+                print(f"[figshare]   '{fname}' already fully uploaded with "
+                      f"matching content — reusing, not re-uploading")
+                return ("reuse", existing.get("download_url"), None)
+            print(f"[figshare]   '{fname}' exists remotely but content differs "
+                  f"(MD5 mismatch) — replacing with a fresh upload")
+            self._delete_remote_file(article_id, file_id)
+            return ("fresh", None, None)
+
+        # Incomplete remote entry — likely left over from a killed run.
+        supplied_md5 = existing.get("supplied_md5")
+        if supplied_md5 == file_md5:
+            print(f"[figshare]   Found an incomplete upload of '{fname}' "
+                  f"matching current content — resuming it")
+            file_url = FIGSHARE_BASE_URL.format(
+                endpoint=f"account/articles/{article_id}/files/{file_id}"
+            )
+            file_info = _figshare_request("GET", file_url, self.token)
+            return ("resume", file_id, file_info["upload_url"])
+
+        print(f"[figshare]   Found an incomplete upload of '{fname}' that "
+              f"doesn't match current content — discarding and starting fresh")
+        self._delete_remote_file(article_id, file_id)
+        return ("fresh", None, None)
+
+    def _is_part_complete(self, upload_url, part_no):
+        """Check Figshare's own record of whether *part_no* is complete.
+
+        Used when a part PUT raises an exception (timeout, connection
+        aborted, or a 409 Conflict from retrying an already-finished part).
+        Over a high-latency link, the client can time out waiting for
+        Figshare's confirmation response even though the part fully
+        landed and was recorded server-side — blindly retrying that part
+        then gets rejected with 409 (Figshare correctly refusing to
+        re-accept a part it already has). Checking here lets a timeout
+        that was actually a success be recognised as such, instead of
+        being retried (and potentially exhausted) needlessly.
+        """
+        try:
+            info = _figshare_request("GET", upload_url, self.token)
+            for p in info.get("parts", []):
+                if p.get("partNo") == part_no:
+                    status = p.get("status")
+                    print(f"[figshare]   [diag] part {part_no} status check: "
+                          f"{status!r}")
+                    return status == "COMPLETE"
+            print(f"[figshare]   [diag] part {part_no} not found in "
+                  f"upload_url parts list ({len(info.get('parts', []))} "
+                  f"parts returned)")
+        except Exception as exc:
+            print(f"[figshare]   WARNING: could not verify status of part "
+                  f"{part_no} ({exc}); assuming it is not complete")
+        return False
+
+    def _upload_parts(self, upload_url, parts_info, file_path, fname,
+                       max_workers=6, max_attempts=3):
+        """Upload all incomplete parts concurrently, retrying failed parts.
+
+        Parts Figshare already reports as COMPLETE (e.g. from a resumed
+        upload) are skipped rather than re-sent.
+        """
+        parts_to_upload = [
+            p for p in parts_info["parts"] if p.get("status") != "COMPLETE"
+        ]
+        skipped = len(parts_info["parts"]) - len(parts_to_upload)
+        if skipped:
+            print(f"[figshare]   Resuming '{fname}': {skipped} part(s) already "
+                  f"complete, {len(parts_to_upload)} remaining")
+
+        def _upload_one_part(part):
+            part_no = part["partNo"]
+            start = part["startOffset"]
+            end = part["endOffset"] + 1
+            part_url = f"{upload_url}/{part_no}"
+
+            with open(file_path, "rb") as fh:
+                fh.seek(start)
+                chunk = fh.read(end - start)
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    resp = requests.put(
+                        part_url,
+                        headers=_figshare_headers(self.token),
+                        data=chunk,
+                        timeout=(30, 300),  # (connect, read) seconds
+                    )
+                    resp.raise_for_status()
+                    return part_no
+                except requests.exceptions.RequestException as exc:
+                    # The failure might be illusory: the part may have
+                    # actually finished uploading server-side even though
+                    # we didn't get to see a clean response (a slow ack
+                    # over a high-latency link can time out client-side
+                    # after the data has fully landed). Check before
+                    # deciding this attempt genuinely failed.
+                    if self._is_part_complete(upload_url, part_no):
+                        print(f"[figshare]   part {part_no} of {fname}: "
+                              f"connection dropped ({exc}) but Figshare "
+                              f"confirms this part is already complete — "
+                              f"treating as success")
+                        return part_no
+                    if attempt == max_attempts:
+                        raise
+                    wait = 2 ** attempt
+                    print(f"[figshare]   WARNING: part {part_no} of {fname} "
+                          f"failed (attempt {attempt}/{max_attempts}): {exc} "
+                          f"— retrying in {wait}s")
+                    time.sleep(wait)
+
+        if not parts_to_upload:
+            return
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_upload_one_part, p): p for p in parts_to_upload}
+            for future in as_completed(futures):
+                part_no = future.result()  # re-raises if a part exhausted retries
+                print(f"[figshare]   Uploaded part {part_no} of {fname}")
+
+    def _upload_file(self, article_id, file_path):
+        """Upload a single file and return its public download_url.
+
+        Remote Figshare state is checked first (see _reconcile_remote_file)
+        so that killed/interrupted runs resume or reuse instead of creating
+        duplicate file entries. The local manifest is only used afterwards,
+        as a fast-path cache for the common case where nothing changed.
+        """
+        fname = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        file_md5 = _md5(file_path)
+        manifest_key = f"file_{fname}"
+
+        cached = self._manifest.get(manifest_key)
+        if cached and cached.get("md5") == file_md5:
+            # Fast path: manifest agrees with local content. Still fine even
+            # if this is slightly stale, since _reconcile_remote_file below
+            # would catch a real mismatch anyway — but skipping the extra
+            # API round-trip here is worth it for the common no-op case.
+            print(f"[figshare] Skipping {fname} (manifest cache: MD5 matches)")
+            return cached["download_url"]
+
+        max_sessions = 2
+        last_exc = None
+
+        for session_attempt in range(1, max_sessions + 1):
+            action, a, b = self._reconcile_remote_file(article_id, fname, file_md5)
+
+            if action == "reuse":
+                download_url = a
+                self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
+                self._save_manifest()
+                return download_url
+
+            if action == "resume":
+                file_id, upload_url = a, b
+            else:  # "fresh"
+                # Step 1 – initiate upload
+                url = FIGSHARE_BASE_URL.format(
+                    endpoint=f"account/articles/{article_id}/files"
+                )
+                data = {"name": fname, "size": file_size, "md5": file_md5}
+                resp = _figshare_request("POST", url, self.token, data=data)
+                file_url = resp["location"]  # e.g. .../articles/<id>/files/<file_id>
+                file_id = int(file_url.split("/")[-1])
+
+                # Step 2 – get upload token + parts info
+                file_info = _figshare_request("GET", file_url, self.token)
+                upload_url = file_info["upload_url"]
+                print(f"[figshare] Starting upload of {fname} "
+                      f"(session {session_attempt}/{max_sessions})")
+
+            parts_info = _figshare_request("GET", upload_url, self.token)
+            _n_parts = len(parts_info.get("parts", []))
+            if _n_parts:
+                _first = parts_info["parts"][0]
+                _part_size = _first["endOffset"] - _first["startOffset"] + 1
+                print(f"[figshare]   [diag] {fname}: {file_size} bytes, "
+                      f"{_n_parts} part(s), ~{_part_size} bytes/part")
+
+            # Step 3 – upload parts (concurrent, with retry + resume)
+            try:
+                self._upload_parts(upload_url, parts_info, file_path, fname)
+            except Exception as exc:
+                last_exc = exc
+                # This upload session may be stuck (e.g. Figshare still
+                # holding a half-received part from an earlier dropped
+                # connection) rather than just slow -- retrying the same
+                # session further isn't likely to help. Abandon it and, if
+                # attempts remain, start completely fresh with a new
+                # session on the next loop iteration.
+                print(f"[figshare]   Session {session_attempt}/{max_sessions} "
+                      f"for {fname} exhausted its part retries ({exc})")
+                try:
+                    self._delete_remote_file(article_id, file_id)
+                except Exception as del_exc:
+                    print(f"[figshare]   WARNING: could not delete stuck "
+                          f"file entry for {fname} ({del_exc})")
+                if session_attempt < max_sessions:
+                    print(f"[figshare]   Abandoning that session, starting "
+                          f"a fresh one for {fname}")
+                continue
+
+            # Step 4 – complete upload
+            complete_url = FIGSHARE_BASE_URL.format(
+                endpoint=f"account/articles/{article_id}/files/{file_id}"
+            )
+            _figshare_request("POST", complete_url, self.token)
+            print(f"[figshare] Completed upload of {fname}")
+
+            # Retrieve public download URL
+            file_details = _figshare_request("GET", complete_url, self.token)
+            download_url = file_details.get(
+                "download_url",
+                f"https://figshare.com/articles/figure/{article_id}",
+            )
+
+            # Cache in manifest
+            self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
+            self._save_manifest()
+            return download_url
+
+        # All sessions exhausted.
+        raise last_exc
         return download_url
 
     # ------------------------------------------------------------------

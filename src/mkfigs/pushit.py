@@ -724,6 +724,7 @@ def main() -> None:
     args = p.parse_args()
 
     mkfigs_version = get_mkfigs_version()
+    print(f"[mkfigs] Running from commit {mkfigs_version}")
 
     ename, esmdir, notebooks = parse_mkfigs_sh()
     if args.ename:
