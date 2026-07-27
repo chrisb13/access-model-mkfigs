@@ -269,6 +269,29 @@ class FigshareUploader:
         self._delete_remote_file(article_id, file_id)
         return ("fresh", None, None)
 
+    def _is_part_complete(self, upload_url, part_no):
+        """Check Figshare's own record of whether *part_no* is complete.
+
+        Used when a part PUT raises an exception (timeout, connection
+        aborted, or a 409 Conflict from retrying an already-finished part).
+        Over a high-latency link, the client can time out waiting for
+        Figshare's confirmation response even though the part fully
+        landed and was recorded server-side — blindly retrying that part
+        then gets rejected with 409 (Figshare correctly refusing to
+        re-accept a part it already has). Checking here lets a timeout
+        that was actually a success be recognised as such, instead of
+        being retried (and potentially exhausted) needlessly.
+        """
+        try:
+            info = _figshare_request("GET", upload_url, self.token)
+            for p in info.get("parts", []):
+                if p.get("partNo") == part_no:
+                    return p.get("status") == "COMPLETE"
+        except Exception as exc:
+            print(f"[figshare]   WARNING: could not verify status of part "
+                  f"{part_no} ({exc}); assuming it is not complete")
+        return False
+
     def _upload_parts(self, upload_url, parts_info, file_path, fname,
                        max_workers=6, max_attempts=5):
         """Upload all incomplete parts concurrently, retrying failed parts.
@@ -305,6 +328,18 @@ class FigshareUploader:
                     resp.raise_for_status()
                     return part_no
                 except requests.exceptions.RequestException as exc:
+                    # The failure might be illusory: the part may have
+                    # actually finished uploading server-side even though
+                    # we didn't get to see a clean response (a slow ack
+                    # over a high-latency link can time out client-side
+                    # after the data has fully landed). Check before
+                    # deciding this attempt genuinely failed.
+                    if self._is_part_complete(upload_url, part_no):
+                        print(f"[figshare]   part {part_no} of {fname}: "
+                              f"connection dropped ({exc}) but Figshare "
+                              f"confirms this part is already complete — "
+                              f"treating as success")
+                        return part_no
                     if attempt == max_attempts:
                         raise
                     wait = 2 ** attempt
