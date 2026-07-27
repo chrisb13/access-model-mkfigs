@@ -299,7 +299,7 @@ class FigshareUploader:
         return False
 
     def _upload_parts(self, upload_url, parts_info, file_path, fname,
-                       max_workers=6, max_attempts=5):
+                       max_workers=6, max_attempts=3):
         """Upload all incomplete parts concurrently, retrying failed parts.
 
         Parts Figshare already reports as COMPLETE (e.g. from a resumed
@@ -385,53 +385,82 @@ class FigshareUploader:
             print(f"[figshare] Skipping {fname} (manifest cache: MD5 matches)")
             return cached["download_url"]
 
-        action, a, b = self._reconcile_remote_file(article_id, fname, file_md5)
+        max_sessions = 2
+        last_exc = None
 
-        if action == "reuse":
-            download_url = a
+        for session_attempt in range(1, max_sessions + 1):
+            action, a, b = self._reconcile_remote_file(article_id, fname, file_md5)
+
+            if action == "reuse":
+                download_url = a
+                self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
+                self._save_manifest()
+                return download_url
+
+            if action == "resume":
+                file_id, upload_url = a, b
+            else:  # "fresh"
+                # Step 1 – initiate upload
+                url = FIGSHARE_BASE_URL.format(
+                    endpoint=f"account/articles/{article_id}/files"
+                )
+                data = {"name": fname, "size": file_size, "md5": file_md5}
+                resp = _figshare_request("POST", url, self.token, data=data)
+                file_url = resp["location"]  # e.g. .../articles/<id>/files/<file_id>
+                file_id = int(file_url.split("/")[-1])
+
+                # Step 2 – get upload token + parts info
+                file_info = _figshare_request("GET", file_url, self.token)
+                upload_url = file_info["upload_url"]
+                print(f"[figshare] Starting upload of {fname} "
+                      f"(session {session_attempt}/{max_sessions})")
+
+            parts_info = _figshare_request("GET", upload_url, self.token)
+
+            # Step 3 – upload parts (concurrent, with retry + resume)
+            try:
+                self._upload_parts(upload_url, parts_info, file_path, fname)
+            except Exception as exc:
+                last_exc = exc
+                # This upload session may be stuck (e.g. Figshare still
+                # holding a half-received part from an earlier dropped
+                # connection) rather than just slow -- retrying the same
+                # session further isn't likely to help. Abandon it and, if
+                # attempts remain, start completely fresh with a new
+                # session on the next loop iteration.
+                print(f"[figshare]   Session {session_attempt}/{max_sessions} "
+                      f"for {fname} exhausted its part retries ({exc})")
+                try:
+                    self._delete_remote_file(article_id, file_id)
+                except Exception as del_exc:
+                    print(f"[figshare]   WARNING: could not delete stuck "
+                          f"file entry for {fname} ({del_exc})")
+                if session_attempt < max_sessions:
+                    print(f"[figshare]   Abandoning that session, starting "
+                          f"a fresh one for {fname}")
+                continue
+
+            # Step 4 – complete upload
+            complete_url = FIGSHARE_BASE_URL.format(
+                endpoint=f"account/articles/{article_id}/files/{file_id}"
+            )
+            _figshare_request("POST", complete_url, self.token)
+            print(f"[figshare] Completed upload of {fname}")
+
+            # Retrieve public download URL
+            file_details = _figshare_request("GET", complete_url, self.token)
+            download_url = file_details.get(
+                "download_url",
+                f"https://figshare.com/articles/figure/{article_id}",
+            )
+
+            # Cache in manifest
             self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
             self._save_manifest()
             return download_url
 
-        if action == "resume":
-            file_id, upload_url = a, b
-        else:  # "fresh"
-            # Step 1 – initiate upload
-            url = FIGSHARE_BASE_URL.format(
-                endpoint=f"account/articles/{article_id}/files"
-            )
-            data = {"name": fname, "size": file_size, "md5": file_md5}
-            resp = _figshare_request("POST", url, self.token, data=data)
-            file_url = resp["location"]  # e.g. .../articles/<id>/files/<file_id>
-            file_id = int(file_url.split("/")[-1])
-
-            # Step 2 – get upload token + parts info
-            file_info = _figshare_request("GET", file_url, self.token)
-            upload_url = file_info["upload_url"]
-            print(f"[figshare] Starting upload of {fname}")
-
-        parts_info = _figshare_request("GET", upload_url, self.token)
-
-        # Step 3 – upload parts (concurrent, with retry + resume)
-        self._upload_parts(upload_url, parts_info, file_path, fname)
-
-        # Step 4 – complete upload
-        complete_url = FIGSHARE_BASE_URL.format(
-            endpoint=f"account/articles/{article_id}/files/{file_id}"
-        )
-        _figshare_request("POST", complete_url, self.token)
-        print(f"[figshare] Completed upload of {fname}")
-
-        # Retrieve public download URL
-        file_details = _figshare_request("GET", complete_url, self.token)
-        download_url = file_details.get(
-            "download_url",
-            f"https://figshare.com/articles/figure/{article_id}",
-        )
-
-        # Cache in manifest
-        self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
-        self._save_manifest()
+        # All sessions exhausted.
+        raise last_exc
         return download_url
 
     # ------------------------------------------------------------------
