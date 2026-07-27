@@ -107,6 +107,48 @@ class FigshareUploader:
     # Article management
     # ------------------------------------------------------------------
 
+    def _search_articles_by_title(self, title):
+        """Find private articles matching *title* via Figshare's search endpoint.
+
+        POST /account/articles/search avoids the pagination trap of a plain
+        GET account/articles (which defaults to page_size=10, most-recent-
+        first — silently missing older articles once 10+ newer ones exist
+        in the account). Figshare's search may not be a strict equality
+        match, so callers must still filter results by exact title.
+
+        Returns None if the search call itself fails, so the caller can
+        fall back to exhaustive pagination.
+        """
+        url = FIGSHARE_BASE_URL.format(endpoint="account/articles/search")
+        try:
+            return _figshare_request(
+                "POST", url, self.token, data={"search_for": f":title: {title}"}
+            )
+        except Exception as exc:
+            print(f"[figshare]   WARNING: articles/search failed ({exc}), "
+                  f"falling back to full pagination")
+            return None
+
+    def _list_all_articles_paginated(self, page_size=100):
+        """Exhaustively page through GET account/articles.
+
+        Fallback for when the search endpoint is unavailable or unreliable.
+        Loops until a page comes back with fewer than page_size results,
+        rather than trusting page 1 alone (which is all the previous
+        unpaginated call ever looked at).
+        """
+        base_url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
+        all_articles = []
+        page = 1
+        while True:
+            url = f"{base_url}?page={page}&page_size={page_size}"
+            batch = _figshare_request("GET", url, self.token)
+            all_articles.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
+        return all_articles
+
     def _get_or_create_article(self):
         """Return the article_id for this experiment, creating if needed."""
         key = f"article_id_{self.experiment}"
@@ -115,10 +157,15 @@ class FigshareUploader:
             print(f"[figshare] Reusing existing article {article_id} for {self.experiment}")
             return article_id
 
-        # Search private articles for an existing one with the same title
-        url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
-        existing = _figshare_request("GET", url, self.token)
-        for art in existing:
+        # Search private articles for an existing one with the same title.
+        # Prefer the dedicated search endpoint (doesn't require knowing how
+        # many articles exist); fall back to exhaustive pagination if the
+        # search call fails for any reason.
+        candidates = self._search_articles_by_title(self.article_title)
+        if candidates is None:
+            candidates = self._list_all_articles_paginated()
+
+        for art in candidates:
             if art.get("title") == self.article_title:
                 article_id = art["id"]
                 print(f"[figshare] Found existing article {article_id} by title search")
@@ -127,6 +174,7 @@ class FigshareUploader:
                 return article_id
 
         # Create a new private article
+        url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
         data = {
             "title": self.article_title,
             "description": (
