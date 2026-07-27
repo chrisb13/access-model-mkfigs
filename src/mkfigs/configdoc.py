@@ -416,6 +416,12 @@ class FigshareUploader:
                       f"(session {session_attempt}/{max_sessions})")
 
             parts_info = _figshare_request("GET", upload_url, self.token)
+            _n_parts = len(parts_info.get("parts", []))
+            if _n_parts:
+                _first = parts_info["parts"][0]
+                _part_size = _first["endOffset"] - _first["startOffset"] + 1
+                print(f"[figshare]   [diag] {fname}: {file_size} bytes, "
+                      f"{_n_parts} part(s), ~{_part_size} bytes/part")
 
             # Step 3 – upload parts (concurrent, with retry + resume)
             try:
