@@ -189,19 +189,33 @@ class FigshareUploader:
 
         # Search private articles for an existing one with the same title.
         # Prefer the dedicated search endpoint (doesn't require knowing how
-        # many articles exist); fall back to exhaustive pagination if the
-        # search call fails for any reason.
+        # many articles exist). Figshare's search endpoint appears to parse
+        # '+'/'-' in the query as boolean operators (require/exclude)
+        # rather than literal text -- confirmed against real accounts: a
+        # search for a title containing either character (most experiment
+        # names here do) can come back with zero matches for an article
+        # that genuinely exists, WITHOUT the search call itself raising.
+        # The previous version only fell back to full pagination when the
+        # search call errored outright, so a "successful but wrong" search
+        # silently fell through to creating a brand new duplicate article
+        # instead of finding the real one. Now: fall back to full
+        # pagination whenever the search path doesn't produce an exact
+        # title match, not only when it errors.
+        found = None
         candidates = self._search_articles_by_title(self.article_title)
-        if candidates is None:
-            candidates = self._list_all_articles_paginated()
+        if candidates is not None:
+            found = next((a for a in candidates if a.get("title") == self.article_title), None)
 
-        for art in candidates:
-            if art.get("title") == self.article_title:
-                article_id = art["id"]
-                print(f"[figshare] Found existing article {article_id} by title search")
-                self._manifest[key] = article_id
-                self._save_manifest()
-                return article_id
+        if found is None:
+            candidates = self._list_all_articles_paginated()
+            found = next((a for a in candidates if a.get("title") == self.article_title), None)
+
+        if found is not None:
+            article_id = found["id"]
+            print(f"[figshare] Found existing article {article_id} by title search")
+            self._manifest[key] = article_id
+            self._save_manifest()
+            return article_id
 
         # Create a new private article
         url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
