@@ -475,24 +475,22 @@ class FigshareUploader:
     def _upload_file(self, article_id, file_path):
         """Upload a single file and return its public download_url.
 
-        Remote Figshare state is checked first (see _reconcile_remote_file)
-        so that killed/interrupted runs resume or reuse instead of creating
-        duplicate file entries. The local manifest is only used afterwards,
-        as a fast-path cache for the common case where nothing changed.
+        Remote Figshare state is always checked (see _reconcile_remote_file)
+        before deciding anything -- there used to be a local-manifest
+        fast path here that skipped that check entirely when the cached
+        MD5 matched. That trusted the manifest indefinitely with no way
+        to ever notice if it stopped being true, and it did, three
+        separate ways in practice: a file manually deleted from Figshare
+        after being cached, a file left stuck incomplete since an
+        earlier Figshare-side error burst, and a duplicate entry hiding
+        a broken sibling behind a working one. The API round-trip this
+        used to save is cheap; being wrong about the one thing this
+        function exists to get right was not.
         """
         fname = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
         file_md5 = _md5(file_path)
         manifest_key = f"file_{fname}"
-
-        cached = self._manifest.get(manifest_key)
-        if cached and cached.get("md5") == file_md5:
-            # Fast path: manifest agrees with local content. Still fine even
-            # if this is slightly stale, since _reconcile_remote_file below
-            # would catch a real mismatch anyway — but skipping the extra
-            # API round-trip here is worth it for the common no-op case.
-            print(f"[figshare] Skipping {fname} (manifest cache: MD5 matches)")
-            return cached["download_url"]
 
         max_sessions = 2
         last_exc = None
@@ -669,13 +667,13 @@ class FigshareUploader:
 
         file_md5 = _md5(nb_path)
         manifest_key = f"notebook_{nb_name}"
-        if manifest_key in self._manifest:
-            cached = self._manifest[manifest_key]
-            if cached.get("md5") == file_md5:
-                print(f"[figshare] Skipping notebook {nb_name} (already uploaded, MD5 matches)")
-                return cached["download_url"]
-            else:
-                print(f"[figshare] MD5 changed for notebook {nb_name}, re-uploading")
+        # No fast-path skip here either -- see _upload_file's docstring for
+        # why. This used to check its own separate notebook_{nb_name}
+        # manifest entry and return early, meaning even fixing
+        # _upload_file's fast path alone would NOT have caught notebooks:
+        # this guard runs first and never reaches _upload_file at all when
+        # it hits. Always delegate through, and let _upload_file's own
+        # (now-live) check decide.
 
         download_url = self._upload_file(article_id, nb_path)
         # Store under the notebook-specific key (upload_file also stores under
