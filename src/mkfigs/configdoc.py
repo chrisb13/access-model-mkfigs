@@ -55,6 +55,36 @@ def _md5(path):
     return h.hexdigest()
 
 
+def assign_pngs_to_notebooks(mdfol, notebook_names):
+    """Map each PNG in *mdfol* to exactly one notebook name.
+
+    A naive f"{nb}_*.png" glob/startswith check per notebook double-counts
+    (or misattributes) whenever one notebook's name is a prefix of
+    another's -- e.g. "MLD" incorrectly matches "MLD_max_01.png" too,
+    since "MLD_max_01.png".startswith("MLD_") is also true. Confirmed to
+    cause real failures: a notebook's PNG loop can wander into a
+    completely different notebook's (broken) file via this collision and
+    abort before ever reaching its own rendered.ipynb upload step.
+
+    Fix: check longest names first, so "MLD_max" claims its own PNGs
+    before "MLD" ever gets a chance to.
+
+    Returns {notebook_name: [png_filename, ...]}.
+    """
+    names_longest_first = sorted(set(notebook_names), key=len, reverse=True)
+    owned = {nb: [] for nb in names_longest_first}
+    if not os.path.isdir(mdfol):
+        return owned
+    for fname in sorted(os.listdir(mdfol)):
+        if not fname.lower().endswith(".png"):
+            continue
+        for nb in names_longest_first:
+            if fname.startswith(f"{nb}_"):
+                owned[nb].append(fname)
+                break
+    return owned
+
+
 class FigshareUploader:
     """Upload PNG figures and rendered notebooks to a figshare article.
 
@@ -256,13 +286,27 @@ class FigshareUploader:
         # Incomplete remote entry — likely left over from a killed run.
         supplied_md5 = existing.get("supplied_md5")
         if supplied_md5 == file_md5:
-            print(f"[figshare]   Found an incomplete upload of '{fname}' "
-                  f"matching current content — resuming it")
             file_url = FIGSHARE_BASE_URL.format(
                 endpoint=f"account/articles/{article_id}/files/{file_id}"
             )
             file_info = _figshare_request("GET", file_url, self.token)
-            return ("resume", file_id, file_info["upload_url"])
+            upload_url = file_info.get("upload_url")
+            if not upload_url:
+                # Some incomplete entries -- seen after a burst of Figshare-
+                # side errors -- come back with no usable upload_url at
+                # all. Trying to resume these used to crash with
+                # "Invalid URL '': No scheme supplied", aborting the whole
+                # notebook's remaining uploads. There's no way to resume
+                # without a valid upload_url, so discard the broken entry
+                # and fall through to a normal fresh upload instead.
+                print(f"[figshare]   Incomplete upload of '{fname}' has no "
+                      f"usable upload_url on Figshare's side — discarding "
+                      f"the stale entry and uploading fresh")
+                self._delete_remote_file(article_id, file_id)
+                return ("fresh", None, None)
+            print(f"[figshare]   Found an incomplete upload of '{fname}' "
+                  f"matching current content — resuming it")
+            return ("resume", file_id, upload_url)
 
         print(f"[figshare]   Found an incomplete upload of '{fname}' that "
               f"doesn't match current content — discarding and starting fresh")
@@ -460,6 +504,23 @@ class FigshareUploader:
                 f"https://figshare.com/articles/figure/{article_id}",
             )
 
+            # This check is free -- file_details was already fetched above.
+            # Figshare only populates computed_md5 once it has genuinely
+            # finished processing a file server-side; occasionally that
+            # hasn't happened yet even though the complete call above
+            # returned success and a working download_url. Previously this
+            # went completely unnoticed: the manifest cache below trusts
+            # this result forever afterwards, so if computed_md5 never
+            # does show up, nothing would ever flag it again. Surface it
+            # now instead of staying silent.
+            if not file_details.get("computed_md5"):
+                print(f"[figshare]   NOTE: '{fname}' completed but Figshare "
+                      f"hasn't finished processing it yet (no computed_md5 "
+                      f"returned). The download URL above should still work; "
+                      f"if this persists, re-check with a tool that queries "
+                      f"live Figshare state rather than trusting this run's "
+                      f"cache -- e.g. re-run and inspect this file specifically.")
+
             # Cache in manifest
             self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
             self._save_manifest()
@@ -486,16 +547,29 @@ class FigshareUploader:
         """Upload every PNG in ``self.mdfol`` that belongs to *nb_name*.
 
         PNG files are named ``<nb_name>_<NN>.png`` (the pattern used by
-        MkmdWriter.savefig).  Returns a dict mapping filename → download URL.
+        MkmdWriter.savefig). Ownership is resolved via
+        assign_pngs_to_notebooks() against every notebook with a rendered
+        output in the parent output folder, not a bare prefix match on
+        nb_name alone -- see that function's docstring for why (a plain
+        f"{nb_name}_*.png" match also catches other notebooks whose name
+        happens to start with nb_name, e.g. "MLD" matching "MLD_max"'s
+        PNGs too). Returns a dict mapping filename → download URL.
         """
         results = {}
         if not os.path.isdir(self.mdfol):
             print(f"[figshare] mdfol not found: {self.mdfol}")
             return results
-        pngs = sorted(
-            f for f in os.listdir(self.mdfol)
-            if f.lower().endswith(".png") and f.startswith(f"{nb_name}_")
-        )
+
+        ofol = os.path.dirname(os.path.normpath(self.mdfol))
+        all_notebook_names = [
+            f[: -len("_rendered.ipynb")]
+            for f in os.listdir(ofol)
+            if f.endswith("_rendered.ipynb")
+        ] if os.path.isdir(ofol) else [nb_name]
+        if nb_name not in all_notebook_names:
+            all_notebook_names.append(nb_name)
+
+        pngs = sorted(assign_pngs_to_notebooks(self.mdfol, all_notebook_names).get(nb_name, []))
         if not pngs:
             print(f"[figshare] No PNG files found for notebook {nb_name} in {self.mdfol}")
             return results

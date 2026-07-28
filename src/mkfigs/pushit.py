@@ -40,7 +40,7 @@ from pathlib import Path
 import yaml
 
 from . import get_mkfigs_version
-from .configdoc import figshare_upload_and_rewrite
+from .configdoc import figshare_upload_and_rewrite, assign_pngs_to_notebooks
 
 
 def _check_nci_environment() -> None:
@@ -788,9 +788,16 @@ def main() -> None:
     not_run_nbs:        list[str] = []
     prev_committed_nbs: list[str] = []
 
+    # See assign_pngs_to_notebooks()'s docstring: a bare f"{nb}_*.png" glob
+    # per notebook misattributes PNGs whenever one notebook's name is a
+    # prefix of another's (e.g. "MLD" matching "MLD_max"'s PNGs too),
+    # which can make a notebook look OK/FAILED based on the wrong PNGs.
+    # Resolve ownership once, up front, against the full notebook list.
+    pngs_by_notebook = assign_pngs_to_notebooks(mdfol, notebooks) if mdfol.exists() else {}
+
     for nb in notebooks:
         rendered = ofol / f"{nb}_rendered.ipynb"
-        pngs     = list(mdfol.glob(f"{nb}_*.png")) if mdfol.exists() else []
+        pngs     = pngs_by_notebook.get(nb, [])
         nb_md    = mdfol / f"{nb}.md"
         if not rendered.exists():
             not_run_nbs.append(nb)
