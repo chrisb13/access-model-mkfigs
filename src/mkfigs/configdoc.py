@@ -227,19 +227,84 @@ class FigshareUploader:
     # File upload
     # ------------------------------------------------------------------
 
-    def _list_remote_files(self, article_id):
-        """Return the list of file dicts currently attached to *article_id*."""
-        url = FIGSHARE_BASE_URL.format(
-            endpoint=f"account/articles/{article_id}/files"
-        )
-        return _figshare_request("GET", url, self.token)
+    def _list_remote_files(self, article_id, page_size=100):
+        """Return every file dict currently attached to *article_id*.
+
+        This previously made a single unpaginated GET, which defaults to
+        page_size=10 and silently truncates -- confirmed directly
+        elsewhere against this exact endpoint (a real 93-file article
+        returned only 10 files with no page_size set). Every experiment
+        here has 35-130+ files, so any file beyond whatever the API
+        happened to return first was permanently invisible to
+        _find_remote_file, which meant _reconcile_remote_file always took
+        the "fresh" branch for it, regardless of whether a perfectly good
+        copy already existed -- one of two confirmed mechanisms behind
+        the duplicate file entries found in real accounts (the other is
+        in _find_remote_file below).
+        """
+        files = []
+        page = 1
+        while True:
+            url = FIGSHARE_BASE_URL.format(
+                endpoint=f"account/articles/{article_id}/files"
+                         f"?page={page}&page_size={page_size}"
+            )
+            batch = _figshare_request("GET", url, self.token)
+            if not batch:
+                break
+            files.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
+        return files
 
     def _find_remote_file(self, article_id, fname):
-        """Return the remote file dict named *fname* on *article_id*, or None."""
-        for f in self._list_remote_files(article_id):
-            if f.get("name") == fname:
-                return f
-        return None
+        """Return the remote file dict named *fname* on *article_id*, or
+        None if it doesn't exist at all.
+
+        Figshare allows more than one file entry under the same name in
+        one article -- confirmed against real accounts, where a broken
+        stub (failed/incomplete upload) and a working copy coexisted
+        under the same filename. The previous version of this method
+        returned whichever entry happened to come first, with no
+        awareness that more might exist; if that happened to be the
+        broken one, _reconcile_remote_file would try to resume or
+        replace *it* specifically while a perfectly good copy sat right
+        next to it, ignored.
+
+        Now: collect every entry sharing *fname*. If any is genuinely
+        complete (status == "available" with a real computed_md5), return
+        the newest one of those (files don't expose a timestamp, but ids
+        are assigned in creation order) -- and, as a side effect, clean
+        up any broken/incomplete siblings while we're already here, so
+        duplicates converge away on subsequent runs instead of
+        accumulating further. This does NOT touch the case of two or
+        more genuinely complete, differing copies -- picking which one
+        should "win" there isn't a call this method should make silently;
+        that's left to a deliberate, reviewable pass (verify_uploads.py
+        --confirm) instead.
+        """
+        matches = [f for f in self._list_remote_files(article_id) if f.get("name") == fname]
+        if not matches:
+            return None
+
+        complete = [f for f in matches if f.get("status") == "available" and f.get("computed_md5")]
+        if not complete:
+            # No genuinely complete entry exists yet -- behave as before,
+            # just on whichever (single, presumably) entry is present.
+            return matches[0]
+
+        newest = max(complete, key=lambda f: f["id"])
+        stubs = [f for f in matches if f is not newest and f not in complete]
+        for stub in stubs:
+            try:
+                self._delete_remote_file(article_id, stub["id"])
+                print(f"[figshare]   Cleaned up a broken duplicate entry for "
+                      f"'{fname}' (id {stub['id']}) alongside the working copy")
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup, not critical path
+                print(f"[figshare]   WARNING: could not clean up stale duplicate "
+                      f"entry for '{fname}' (id {stub['id']}): {exc}")
+        return newest
 
     def _delete_remote_file(self, article_id, file_id):
         """Delete a stale/mismatched/incomplete remote file entry."""
