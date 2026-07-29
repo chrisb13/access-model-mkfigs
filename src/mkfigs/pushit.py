@@ -1066,6 +1066,25 @@ def main() -> None:
             print("           Set FIGSHARE_TOKEN or store token in ~/.figshare_token")
 
     # Merge: new-run URLs take priority over previously committed.
+    # Before merging, validate any carried-forward entries (notebooks not
+    # reprocessed this run) against live Figshare state -- otherwise a
+    # stale entry (file id since changed by duplicate cleanup, any
+    # re-upload) would silently persist forever through this merge. See
+    # FigshareUploader.validate_and_refresh_notebook_urls for the full
+    # explanation; this is the same class of bug as the .md file
+    # staleness issue fixed elsewhere, just via merge-and-carry-forward
+    # instead of a one-shot string replace.
+    carried_forward = {nb: u for nb, u in existing_urls.items() if nb not in notebook_urls}
+    if carried_forward and not args.dry_run and not args.skip_figshare:
+        _token = resolve_figshare_token()
+        if _token:
+            _uploader = FigshareUploader(_token, ename, str(mdfol))
+            _article_id = _uploader._get_or_create_article()
+            existing_urls = {
+                **existing_urls,
+                **_uploader.validate_and_refresh_notebook_urls(_article_id, carried_forward),
+            }
+
     all_notebook_urls = {**existing_urls, **notebook_urls}
     # Track per-notebook run times and package versions for future summary display.
     _ts = run_time.strftime("%Y-%m-%d %H:%M UTC")

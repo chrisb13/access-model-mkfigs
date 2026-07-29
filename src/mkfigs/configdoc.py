@@ -651,6 +651,15 @@ class FigshareUploader:
             print(f"[figshare] No PNG files found for notebook {nb_name} in {self.mdfol}")
             return results
         article_id = self._get_or_create_article()
+        # Capture each file's previously-recorded URL BEFORE _upload_file
+        # overwrites the manifest entry with the new one -- rewrite_markdown
+        # needs this to find and replace an already-embedded (and possibly
+        # now-stale) URL, not just the original local asset path. See
+        # rewrite_markdown's docstring for the full explanation.
+        self._prev_urls_by_fname = {
+            fname: self._manifest.get(f"file_{fname}", {}).get("download_url")
+            for fname in pngs
+        }
         for fname in pngs:
             fpath = os.path.join(self.mdfol, fname)
             url = self._upload_file(article_id, fpath)
@@ -703,6 +712,24 @@ class FigshareUploader:
 
         If *nb_name* is given, rewrites ``<mdfol>/<nb_name>.md``.
         ``url_map`` is a dict mapping PNG filename → figshare download URL.
+
+        THIS WAS THE ROOT CAUSE of a real bug found and worked around
+        externally before being fixed here: this only ever matched the
+        original local asset path. The first time a notebook's markdown
+        gets rewritten that works fine, but on every run after that the
+        local path is already gone from the text (replaced by whatever
+        URL was correct THEN), so the replace found nothing and silently
+        did nothing -- the embedded URL got permanently frozen at
+        whatever it was on the first successful rewrite, even if the
+        underlying Figshare file id changed later (duplicate cleanup, any
+        re-upload) without this notebook being freshly re-executed.
+
+        Fix: also try replacing whatever URL was PREVIOUSLY recorded for
+        this filename (self._prev_urls_by_fname, populated by
+        upload_pngs_for_notebook from the manifest's value BEFORE it gets
+        overwritten this run) -- so a markdown file that's already been
+        through one rewrite can still be correctly updated on any later
+        run, not just the first one.
         """
         stem = nb_name if nb_name else self.experiment
         mdpath = os.path.join(self.mdfol, f"{stem}.md")
@@ -717,9 +744,28 @@ class FigshareUploader:
         with open(mdpath + ".bak", "w") as f:
             f.write(content)
 
+        prev_urls_by_fname = getattr(self, "_prev_urls_by_fname", {})
+
         for fname, url in url_map.items():
             old_pattern = f"/assets/experiments/{self.experiment}/{fname}"
-            content = content.replace(old_pattern, url)
+            if old_pattern in content:
+                # Fresh markdown, never rewritten before.
+                content = content.replace(old_pattern, url)
+                continue
+
+            prev_url = prev_urls_by_fname.get(fname)
+            if prev_url and prev_url != url and prev_url in content:
+                # Already-rewritten markdown from an earlier run -- the
+                # local path is gone, but we know what URL replaced it
+                # last time, so we can find and correct it even though
+                # its value has changed since.
+                content = content.replace(prev_url, url)
+                continue
+
+            # Neither pattern present: this fname genuinely isn't
+            # referenced in this markdown file (fine -- e.g. belongs to
+            # a different notebook), or something unexpected. Leave
+            # content alone rather than guess at what to replace.
 
         with open(mdpath, "w") as f:
             f.write(content)
@@ -732,6 +778,72 @@ class FigshareUploader:
         if article_id:
             return f"https://figshare.com/articles/figure/{article_id}"
         return None
+
+    def validate_and_refresh_notebook_urls(self, article_id, existing_urls):
+        """Check each carried-forward notebook URL against live Figshare
+        state, refreshing any that have gone stale.
+
+        Root cause this addresses: pushit.py's main() merges
+        notebooks_urls.json's existing content with each run's fresh
+        results (``all_notebook_urls = {**existing_urls, **notebook_urls}``).
+        A notebook's entry only updates if that notebook is successfully
+        reprocessed THIS run; anything not touched carries its old value
+        forward indefinitely. If a notebook's file id later changes on
+        Figshare (duplicate cleanup, any re-upload) without that notebook
+        being reprocessed in a later run, its entry silently goes stale
+        and nothing ever corrects it on its own -- the same class of bug
+        as rewrite_markdown's, just via a different mechanism (merge
+        instead of one-shot string replace).
+
+        For each entry, checks whether its URL's file id still exists on
+        Figshare AND is named "<notebook>_rendered.ipynb". If not, looks
+        for the current correct file under that exact name and refreshes
+        the URL -- picking the newest if more than one complete match
+        exists (same convention as _find_remote_file). If NO complete
+        match exists at all, the entry is left AS-IS rather than dropped,
+        so it still shows up as a real, visible failure in
+        --check-figshare-upload instead of silently disappearing from
+        the tracked set.
+
+        *existing_urls* should be pre-filtered by the caller to just the
+        entries NOT already refreshed by this run's own uploads -- no
+        need to re-check something we just uploaded ourselves.
+        """
+        if not existing_urls:
+            return dict(existing_urls)
+
+        all_files = self._list_remote_files(article_id)
+        by_name = {}
+        for f in all_files:
+            by_name.setdefault(f["name"], []).append(f)
+
+        refreshed = dict(existing_urls)
+        for nb, url in existing_urls.items():
+            expected_name = f"{nb}_rendered.ipynb"
+            try:
+                current_id = int(url.rsplit("/", 1)[-1])
+            except ValueError:
+                continue
+
+            matches = by_name.get(expected_name, [])
+            complete = [m for m in matches
+                        if m.get("status") == "available" and m.get("computed_md5")]
+            if any(m["id"] == current_id for m in complete):
+                continue  # still valid
+
+            if not complete:
+                print(f"[figshare] WARNING: notebooks_urls.json entry for '{nb}' "
+                      f"(file {current_id}) appears stale and no replacement was "
+                      f"found on Figshare -- leaving as-is so it shows as a real "
+                      f"failure rather than silently disappearing.")
+                continue
+
+            newest = max(complete, key=lambda m: m["id"])
+            print(f"[figshare] Refreshed stale notebooks_urls.json entry for "
+                  f"'{nb}': file/{current_id} -> file/{newest['id']}")
+            refreshed[nb] = f"https://ndownloader.figshare.com/files/{newest['id']}"
+
+        return refreshed
 
 
 # ---------------------------------------------------------------------------
