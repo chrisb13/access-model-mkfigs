@@ -11,15 +11,21 @@ internet access) after mkfigs.sh completes:
 
     cd /g/data/tm70/cyb561/repos/<paper-repo>/notebooks
     mkfigs-pushit
-    mkfigs-pushit --dry-run               # preview: nothing written or uploaded
-    mkfigs-pushit --skip-figshare         # copy files, but skip upload
-    mkfigs-pushit --ename MC_25km_...     # override experiment name
-    mkfigs-pushit --check-figshare-upload # verify URLs public, print git commands
+    mkfigs-pushit --dry-run                  # preview: nothing written or uploaded
+    mkfigs-pushit --skip-figshare            # copy files, but skip upload
+    mkfigs-pushit --ename MC_25km_...        # override experiment name
+    mkfigs-pushit --check-figshare-integrity # verify uploads complete/duplicate-free
+    mkfigs-pushit --check-figshare-upload    # verify URLs public, print git commands
 
 Suggested workflow:
-  1. mkfigs-pushit                         — upload to Figshare, copy docs files
-  2. Publish the Figshare article
-  3. mkfigs-pushit --check-figshare-upload — verify URLs, get git commands
+  1. mkfigs-pushit                          — upload to Figshare, copy docs files
+  2. mkfigs-pushit --check-figshare-integrity — verify complete & duplicate-free
+                                                (reads private Figshare state via the
+                                                API, so this works BEFORE publishing)
+  3. Publish the Figshare article
+  4. mkfigs-pushit --check-figshare-upload  — verify URLs, get git commands
+                                                (checks public reachability, so this
+                                                only makes sense AFTER publishing)
 
 Figshare token: set FIGSHARE_TOKEN env var, or store in ~/.figshare_token.
 """
@@ -40,7 +46,7 @@ from pathlib import Path
 import yaml
 
 from . import get_mkfigs_version
-from .configdoc import figshare_upload_and_rewrite
+from .configdoc import figshare_upload_and_rewrite, assign_pngs_to_notebooks, FigshareUploader, _md5
 
 
 def _check_nci_environment() -> None:
@@ -452,6 +458,191 @@ def check_figshare_upload_mode(ename: str) -> None:
     print()
 
 
+def _classify_duplicates(entries: list[dict], local_md5: str):
+    """Given 2+ remote file entries sharing one name, decide what's safe
+    to clean up automatically. Ported from the standalone verify_uploads.py
+    checker developed alongside this mode -- see that script's history for
+    how each case was found against real accounts.
+
+    Returns (action, ids_to_delete, note):
+      "delete_stubs"       -- broken/incomplete entries alongside a
+                               genuine complete copy. Safe regardless of
+                               content -- Figshare's own UI text confirms
+                               unsuccessful uploads never appear publicly.
+      "delete_older_dupes" -- 2+ complete entries, identical to each
+                               other AND to local_md5. Keeps the newest
+                               (highest id -- files expose no timestamp).
+      "stale_duplicates"   -- complete entries agree with each other but
+                               NOT with the current local file. Flagged
+                               only -- which copy (if any) should survive
+                               isn't this function's call.
+      "conflicting"        -- complete entries disagree with EACH OTHER.
+                               Flagged only, needs manual review.
+      (None, [], "")       -- nothing to do.
+    """
+    if len(entries) < 2:
+        return (None, [], "")
+
+    complete = [e for e in entries if e.get("status") == "available" and e.get("computed_md5")]
+    stubs = [e for e in entries if e not in complete]
+
+    if complete and stubs:
+        return ("delete_stubs", [e["id"] for e in stubs],
+                f"{len(stubs)} broken/incomplete entr{'y' if len(stubs) == 1 else 'ies'} "
+                f"alongside {len(complete)} working cop{'y' if len(complete) == 1 else 'ies'}")
+
+    if len(complete) >= 2:
+        md5s = {e["computed_md5"] for e in complete}
+        if len(md5s) == 1:
+            shared_md5 = next(iter(md5s))
+            if shared_md5 == local_md5:
+                newest = max(complete, key=lambda e: e["id"])
+                older = [e["id"] for e in complete if e["id"] != newest["id"]]
+                return ("delete_older_dupes", older,
+                        f"{len(complete)} identical complete copies, matches local file "
+                        f"-- keeping newest (id {newest['id']})")
+            return ("stale_duplicates", [],
+                    f"{len(complete)} identical complete copies, but content does NOT "
+                    f"match the current local file -- needs manual review")
+        return ("conflicting", [],
+                f"{len(complete)} complete copies with DIFFERING content "
+                f"({len(md5s)} distinct md5s) -- needs manual review")
+
+    return (None, [], "")
+
+
+def check_figshare_integrity_mode(ename: str, fix_duplicates: bool = False) -> None:
+    """--check-figshare-integrity: verify uploads are complete and
+    duplicate-free, BEFORE publishing.
+
+    Complements check_figshare_upload_mode rather than replacing it:
+    that one only makes sense AFTER publishing, since it checks whether
+    the public ndownloader URLs resolve -- structurally unable to catch
+    a duplicate file entry whose broken sibling never appears publicly
+    in the first place (a good copy under the same name resolves fine,
+    hiding a real problem). This mode instead reads Figshare's private
+    account state directly via the authenticated API, so it works on a
+    draft article, and checks the actual thing that matters: does
+    computed_md5 for this file, if any complete entry exists at all,
+    match what's on disk right now.
+
+    Suggested workflow:
+      1. mkfigs-pushit
+      2. mkfigs-pushit --check-figshare-integrity   -- this, BEFORE publishing
+      3. Publish the Figshare article
+      4. mkfigs-pushit --check-figshare-upload       -- unchanged, AFTER publishing
+    """
+    token = resolve_figshare_token()
+    if not token:
+        print("No Figshare token found -- set FIGSHARE_TOKEN or store in ~/.figshare_token")
+        sys.exit(1)
+
+    ofol = HERE / f"mkfigs_output_{ename}"
+    mdfol = ofol / "mkmd"
+    if not ofol.exists():
+        print(f"No output folder found: {ofol}. Run mkfigs-pushit first.")
+        sys.exit(1)
+
+    uploader = FigshareUploader(token, ename, str(mdfol))
+
+    # Find the article by exact title match against a full paginated
+    # listing -- deliberately NOT uploader._get_or_create_article(). That
+    # method (a) is vulnerable to the same '+'/'-' query-parsing issue as
+    # the search endpoint for titles containing those characters (most
+    # experiment names here do), and (b) will silently CREATE a new
+    # article if it doesn't find a match, which is the wrong behaviour
+    # for a verification pass that should never have side effects by
+    # default.
+    all_articles = uploader._list_all_articles_paginated()
+    title = uploader.article_title
+    matches = [a for a in all_articles if a.get("title") == title]
+
+    if not matches:
+        print(f"NO ARTICLE -- '{title}' not found on Figshare. Run mkfigs-pushit first.")
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"*** WARNING: {len(matches)} articles share this title -- "
+              f"needs manual cleanup on Figshare ***")
+        for a in matches:
+            print(f"    id {a['id']}")
+    article_id = matches[0]["id"]
+
+    # Same "should exist on Figshare" gate pushit.py's own main loop uses:
+    # a rendered.ipynb existing on disk does NOT mean the notebook
+    # succeeded (nbconvert/papermill can leave one behind after an
+    # error) -- only count it if it also produced PNGs or markdown.
+    _, _esmdir, notebooks = parse_mkfigs_sh()
+    pngs_by_nb = assign_pngs_to_notebooks(mdfol, notebooks)
+    local_names: dict[str, str] = {}  # filename -> local md5
+    for nb in notebooks:
+        rendered = ofol / f"{nb}_rendered.ipynb"
+        pngs = pngs_by_nb.get(nb, [])
+        nb_md = mdfol / f"{nb}.md"
+        if not rendered.exists() or (not pngs and not nb_md.exists()):
+            continue
+        local_names[rendered.name] = _md5(rendered)
+        for png_name in pngs:
+            local_names[png_name] = _md5(mdfol / png_name)
+
+    if not local_names:
+        print(f"No successfully-rendered notebooks found for {ename} -- nothing to check.")
+        return
+
+    raw_files = uploader._list_remote_files(article_id)
+    by_name: dict[str, list[dict]] = {}
+    for f in raw_files:
+        by_name.setdefault(f["name"], []).append(f)
+
+    print(f"\nChecking {len(local_names)} file(s) for {ename} against article {article_id}...\n")
+
+    missing, pending, mismatch = [], [], []
+    for fname, local_md5 in sorted(local_names.items()):
+        entries = by_name.get(fname, [])
+        if not entries:
+            missing.append(fname)
+            continue
+        if any(e.get("computed_md5") == local_md5 for e in entries):
+            continue  # OK
+        if any(e.get("computed_md5") for e in entries):
+            mismatch.append(fname)
+        else:
+            pending.append(fname)
+
+    extra = sorted(set(by_name) - set(local_names))
+
+    dup_report = []
+    for fname, local_md5 in sorted(local_names.items()):
+        entries = by_name.get(fname, [])
+        action, ids, note = _classify_duplicates(entries, local_md5)
+        if action is None:
+            continue
+        dup_report.append((fname, action, ids, note))
+
+    for label, names in (("MISSING", missing), ("PENDING", pending), ("MISMATCH", mismatch)):
+        for n in names:
+            print(f"  {label:9s} {n}")
+    for n in extra:
+        print(f"  EXTRA     {n}  (on Figshare, no local file with this name)")
+    for fname, action, ids, note in dup_report:
+        tag = {"delete_stubs": "DUP-STUB", "delete_older_dupes": "DUP-OLD ",
+               "stale_duplicates": "DUP-STALE", "conflicting": "DUP-CONFLICT"}[action]
+        print(f"  {tag:12s} {fname}  ({note})")
+        if action in ("delete_stubs", "delete_older_dupes"):
+            for file_id in ids:
+                if fix_duplicates:
+                    uploader._delete_remote_file(article_id, file_id)
+                else:
+                    print(f"               -> would delete id {file_id} "
+                          f"(pass --fix-duplicates to actually delete)")
+
+    problems = missing or pending or mismatch or extra or dup_report
+    if problems:
+        print(f"\n{ename} is NOT ready to publish -- see issues above.")
+        sys.exit(1)
+    print(f"\n{ename}: all {len(local_names)} file(s) present and correct, "
+          f"no duplicates. Safe to publish.")
+
+
 # ---------------------------------------------------------------------------
 # mkdocs.yml helpers
 # ---------------------------------------------------------------------------
@@ -720,7 +911,16 @@ def main() -> None:
     p.add_argument("--ename", default=None,
                    help="Override experiment name (default: parsed from mkfigs.sh)")
     p.add_argument("--check-figshare-upload", action="store_true",
-                   help="Verify all Figshare URLs are public, then print git commands")
+                   help="Verify all Figshare URLs are public, then print git commands "
+                        "(run AFTER publishing)")
+    p.add_argument("--check-figshare-integrity", action="store_true",
+                   help="Verify uploads are complete, correct, and duplicate-free "
+                        "(run BEFORE publishing)")
+    p.add_argument("--fix-duplicates", action="store_true",
+                   help="With --check-figshare-integrity: actually delete safe-to-remove "
+                        "duplicates (broken stubs, and older copies of an exact duplicate "
+                        "matching the local file). Without this, reported but not deleted. "
+                        "Ambiguous duplicates are never auto-deleted regardless of this flag.")
     args = p.parse_args()
 
     mkfigs_version = get_mkfigs_version()
@@ -732,6 +932,10 @@ def main() -> None:
 
     if args.check_figshare_upload:
         check_figshare_upload_mode(ename)
+        return
+
+    if args.check_figshare_integrity:
+        check_figshare_integrity_mode(ename, fix_duplicates=args.fix_duplicates)
         return
 
     ofol  = HERE / f"mkfigs_output_{ename}"
@@ -788,9 +992,16 @@ def main() -> None:
     not_run_nbs:        list[str] = []
     prev_committed_nbs: list[str] = []
 
+    # See assign_pngs_to_notebooks()'s docstring: a bare f"{nb}_*.png" glob
+    # per notebook misattributes PNGs whenever one notebook's name is a
+    # prefix of another's (e.g. "MLD" matching "MLD_max"'s PNGs too),
+    # which can make a notebook look OK/FAILED based on the wrong PNGs.
+    # Resolve ownership once, up front, against the full notebook list.
+    pngs_by_notebook = assign_pngs_to_notebooks(mdfol, notebooks) if mdfol.exists() else {}
+
     for nb in notebooks:
         rendered = ofol / f"{nb}_rendered.ipynb"
-        pngs     = list(mdfol.glob(f"{nb}_*.png")) if mdfol.exists() else []
+        pngs     = pngs_by_notebook.get(nb, [])
         nb_md    = mdfol / f"{nb}.md"
         if not rendered.exists():
             not_run_nbs.append(nb)
@@ -855,6 +1066,25 @@ def main() -> None:
             print("           Set FIGSHARE_TOKEN or store token in ~/.figshare_token")
 
     # Merge: new-run URLs take priority over previously committed.
+    # Before merging, validate any carried-forward entries (notebooks not
+    # reprocessed this run) against live Figshare state -- otherwise a
+    # stale entry (file id since changed by duplicate cleanup, any
+    # re-upload) would silently persist forever through this merge. See
+    # FigshareUploader.validate_and_refresh_notebook_urls for the full
+    # explanation; this is the same class of bug as the .md file
+    # staleness issue fixed elsewhere, just via merge-and-carry-forward
+    # instead of a one-shot string replace.
+    carried_forward = {nb: u for nb, u in existing_urls.items() if nb not in notebook_urls}
+    if carried_forward and not args.dry_run and not args.skip_figshare:
+        _token = resolve_figshare_token()
+        if _token:
+            _uploader = FigshareUploader(_token, ename, str(mdfol))
+            _article_id = _uploader._get_or_create_article()
+            existing_urls = {
+                **existing_urls,
+                **_uploader.validate_and_refresh_notebook_urls(_article_id, carried_forward),
+            }
+
     all_notebook_urls = {**existing_urls, **notebook_urls}
     # Track per-notebook run times and package versions for future summary display.
     _ts = run_time.strftime("%Y-%m-%d %H:%M UTC")

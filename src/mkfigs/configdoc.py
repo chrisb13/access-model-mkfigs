@@ -55,6 +55,36 @@ def _md5(path):
     return h.hexdigest()
 
 
+def assign_pngs_to_notebooks(mdfol, notebook_names):
+    """Map each PNG in *mdfol* to exactly one notebook name.
+
+    A naive f"{nb}_*.png" glob/startswith check per notebook double-counts
+    (or misattributes) whenever one notebook's name is a prefix of
+    another's -- e.g. "MLD" incorrectly matches "MLD_max_01.png" too,
+    since "MLD_max_01.png".startswith("MLD_") is also true. Confirmed to
+    cause real failures: a notebook's PNG loop can wander into a
+    completely different notebook's (broken) file via this collision and
+    abort before ever reaching its own rendered.ipynb upload step.
+
+    Fix: check longest names first, so "MLD_max" claims its own PNGs
+    before "MLD" ever gets a chance to.
+
+    Returns {notebook_name: [png_filename, ...]}.
+    """
+    names_longest_first = sorted(set(notebook_names), key=len, reverse=True)
+    owned = {nb: [] for nb in names_longest_first}
+    if not os.path.isdir(mdfol):
+        return owned
+    for fname in sorted(os.listdir(mdfol)):
+        if not fname.lower().endswith(".png"):
+            continue
+        for nb in names_longest_first:
+            if fname.startswith(f"{nb}_"):
+                owned[nb].append(fname)
+                break
+    return owned
+
+
 class FigshareUploader:
     """Upload PNG figures and rendered notebooks to a figshare article.
 
@@ -159,19 +189,33 @@ class FigshareUploader:
 
         # Search private articles for an existing one with the same title.
         # Prefer the dedicated search endpoint (doesn't require knowing how
-        # many articles exist); fall back to exhaustive pagination if the
-        # search call fails for any reason.
+        # many articles exist). Figshare's search endpoint appears to parse
+        # '+'/'-' in the query as boolean operators (require/exclude)
+        # rather than literal text -- confirmed against real accounts: a
+        # search for a title containing either character (most experiment
+        # names here do) can come back with zero matches for an article
+        # that genuinely exists, WITHOUT the search call itself raising.
+        # The previous version only fell back to full pagination when the
+        # search call errored outright, so a "successful but wrong" search
+        # silently fell through to creating a brand new duplicate article
+        # instead of finding the real one. Now: fall back to full
+        # pagination whenever the search path doesn't produce an exact
+        # title match, not only when it errors.
+        found = None
         candidates = self._search_articles_by_title(self.article_title)
-        if candidates is None:
-            candidates = self._list_all_articles_paginated()
+        if candidates is not None:
+            found = next((a for a in candidates if a.get("title") == self.article_title), None)
 
-        for art in candidates:
-            if art.get("title") == self.article_title:
-                article_id = art["id"]
-                print(f"[figshare] Found existing article {article_id} by title search")
-                self._manifest[key] = article_id
-                self._save_manifest()
-                return article_id
+        if found is None:
+            candidates = self._list_all_articles_paginated()
+            found = next((a for a in candidates if a.get("title") == self.article_title), None)
+
+        if found is not None:
+            article_id = found["id"]
+            print(f"[figshare] Found existing article {article_id} by title search")
+            self._manifest[key] = article_id
+            self._save_manifest()
+            return article_id
 
         # Create a new private article
         url = FIGSHARE_BASE_URL.format(endpoint="account/articles")
@@ -197,19 +241,84 @@ class FigshareUploader:
     # File upload
     # ------------------------------------------------------------------
 
-    def _list_remote_files(self, article_id):
-        """Return the list of file dicts currently attached to *article_id*."""
-        url = FIGSHARE_BASE_URL.format(
-            endpoint=f"account/articles/{article_id}/files"
-        )
-        return _figshare_request("GET", url, self.token)
+    def _list_remote_files(self, article_id, page_size=100):
+        """Return every file dict currently attached to *article_id*.
+
+        This previously made a single unpaginated GET, which defaults to
+        page_size=10 and silently truncates -- confirmed directly
+        elsewhere against this exact endpoint (a real 93-file article
+        returned only 10 files with no page_size set). Every experiment
+        here has 35-130+ files, so any file beyond whatever the API
+        happened to return first was permanently invisible to
+        _find_remote_file, which meant _reconcile_remote_file always took
+        the "fresh" branch for it, regardless of whether a perfectly good
+        copy already existed -- one of two confirmed mechanisms behind
+        the duplicate file entries found in real accounts (the other is
+        in _find_remote_file below).
+        """
+        files = []
+        page = 1
+        while True:
+            url = FIGSHARE_BASE_URL.format(
+                endpoint=f"account/articles/{article_id}/files"
+                         f"?page={page}&page_size={page_size}"
+            )
+            batch = _figshare_request("GET", url, self.token)
+            if not batch:
+                break
+            files.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
+        return files
 
     def _find_remote_file(self, article_id, fname):
-        """Return the remote file dict named *fname* on *article_id*, or None."""
-        for f in self._list_remote_files(article_id):
-            if f.get("name") == fname:
-                return f
-        return None
+        """Return the remote file dict named *fname* on *article_id*, or
+        None if it doesn't exist at all.
+
+        Figshare allows more than one file entry under the same name in
+        one article -- confirmed against real accounts, where a broken
+        stub (failed/incomplete upload) and a working copy coexisted
+        under the same filename. The previous version of this method
+        returned whichever entry happened to come first, with no
+        awareness that more might exist; if that happened to be the
+        broken one, _reconcile_remote_file would try to resume or
+        replace *it* specifically while a perfectly good copy sat right
+        next to it, ignored.
+
+        Now: collect every entry sharing *fname*. If any is genuinely
+        complete (status == "available" with a real computed_md5), return
+        the newest one of those (files don't expose a timestamp, but ids
+        are assigned in creation order) -- and, as a side effect, clean
+        up any broken/incomplete siblings while we're already here, so
+        duplicates converge away on subsequent runs instead of
+        accumulating further. This does NOT touch the case of two or
+        more genuinely complete, differing copies -- picking which one
+        should "win" there isn't a call this method should make silently;
+        that's left to a deliberate, reviewable pass (verify_uploads.py
+        --confirm) instead.
+        """
+        matches = [f for f in self._list_remote_files(article_id) if f.get("name") == fname]
+        if not matches:
+            return None
+
+        complete = [f for f in matches if f.get("status") == "available" and f.get("computed_md5")]
+        if not complete:
+            # No genuinely complete entry exists yet -- behave as before,
+            # just on whichever (single, presumably) entry is present.
+            return matches[0]
+
+        newest = max(complete, key=lambda f: f["id"])
+        stubs = [f for f in matches if f is not newest and f not in complete]
+        for stub in stubs:
+            try:
+                self._delete_remote_file(article_id, stub["id"])
+                print(f"[figshare]   Cleaned up a broken duplicate entry for "
+                      f"'{fname}' (id {stub['id']}) alongside the working copy")
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup, not critical path
+                print(f"[figshare]   WARNING: could not clean up stale duplicate "
+                      f"entry for '{fname}' (id {stub['id']}): {exc}")
+        return newest
 
     def _delete_remote_file(self, article_id, file_id):
         """Delete a stale/mismatched/incomplete remote file entry."""
@@ -256,13 +365,27 @@ class FigshareUploader:
         # Incomplete remote entry — likely left over from a killed run.
         supplied_md5 = existing.get("supplied_md5")
         if supplied_md5 == file_md5:
-            print(f"[figshare]   Found an incomplete upload of '{fname}' "
-                  f"matching current content — resuming it")
             file_url = FIGSHARE_BASE_URL.format(
                 endpoint=f"account/articles/{article_id}/files/{file_id}"
             )
             file_info = _figshare_request("GET", file_url, self.token)
-            return ("resume", file_id, file_info["upload_url"])
+            upload_url = file_info.get("upload_url")
+            if not upload_url:
+                # Some incomplete entries -- seen after a burst of Figshare-
+                # side errors -- come back with no usable upload_url at
+                # all. Trying to resume these used to crash with
+                # "Invalid URL '': No scheme supplied", aborting the whole
+                # notebook's remaining uploads. There's no way to resume
+                # without a valid upload_url, so discard the broken entry
+                # and fall through to a normal fresh upload instead.
+                print(f"[figshare]   Incomplete upload of '{fname}' has no "
+                      f"usable upload_url on Figshare's side — discarding "
+                      f"the stale entry and uploading fresh")
+                self._delete_remote_file(article_id, file_id)
+                return ("fresh", None, None)
+            print(f"[figshare]   Found an incomplete upload of '{fname}' "
+                  f"matching current content — resuming it")
+            return ("resume", file_id, upload_url)
 
         print(f"[figshare]   Found an incomplete upload of '{fname}' that "
               f"doesn't match current content — discarding and starting fresh")
@@ -366,24 +489,22 @@ class FigshareUploader:
     def _upload_file(self, article_id, file_path):
         """Upload a single file and return its public download_url.
 
-        Remote Figshare state is checked first (see _reconcile_remote_file)
-        so that killed/interrupted runs resume or reuse instead of creating
-        duplicate file entries. The local manifest is only used afterwards,
-        as a fast-path cache for the common case where nothing changed.
+        Remote Figshare state is always checked (see _reconcile_remote_file)
+        before deciding anything -- there used to be a local-manifest
+        fast path here that skipped that check entirely when the cached
+        MD5 matched. That trusted the manifest indefinitely with no way
+        to ever notice if it stopped being true, and it did, three
+        separate ways in practice: a file manually deleted from Figshare
+        after being cached, a file left stuck incomplete since an
+        earlier Figshare-side error burst, and a duplicate entry hiding
+        a broken sibling behind a working one. The API round-trip this
+        used to save is cheap; being wrong about the one thing this
+        function exists to get right was not.
         """
         fname = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
         file_md5 = _md5(file_path)
         manifest_key = f"file_{fname}"
-
-        cached = self._manifest.get(manifest_key)
-        if cached and cached.get("md5") == file_md5:
-            # Fast path: manifest agrees with local content. Still fine even
-            # if this is slightly stale, since _reconcile_remote_file below
-            # would catch a real mismatch anyway — but skipping the extra
-            # API round-trip here is worth it for the common no-op case.
-            print(f"[figshare] Skipping {fname} (manifest cache: MD5 matches)")
-            return cached["download_url"]
 
         max_sessions = 2
         last_exc = None
@@ -460,6 +581,23 @@ class FigshareUploader:
                 f"https://figshare.com/articles/figure/{article_id}",
             )
 
+            # This check is free -- file_details was already fetched above.
+            # Figshare only populates computed_md5 once it has genuinely
+            # finished processing a file server-side; occasionally that
+            # hasn't happened yet even though the complete call above
+            # returned success and a working download_url. Previously this
+            # went completely unnoticed: the manifest cache below trusts
+            # this result forever afterwards, so if computed_md5 never
+            # does show up, nothing would ever flag it again. Surface it
+            # now instead of staying silent.
+            if not file_details.get("computed_md5"):
+                print(f"[figshare]   NOTE: '{fname}' completed but Figshare "
+                      f"hasn't finished processing it yet (no computed_md5 "
+                      f"returned). The download URL above should still work; "
+                      f"if this persists, re-check with a tool that queries "
+                      f"live Figshare state rather than trusting this run's "
+                      f"cache -- e.g. re-run and inspect this file specifically.")
+
             # Cache in manifest
             self._manifest[manifest_key] = {"md5": file_md5, "download_url": download_url}
             self._save_manifest()
@@ -486,20 +624,42 @@ class FigshareUploader:
         """Upload every PNG in ``self.mdfol`` that belongs to *nb_name*.
 
         PNG files are named ``<nb_name>_<NN>.png`` (the pattern used by
-        MkmdWriter.savefig).  Returns a dict mapping filename → download URL.
+        MkmdWriter.savefig). Ownership is resolved via
+        assign_pngs_to_notebooks() against every notebook with a rendered
+        output in the parent output folder, not a bare prefix match on
+        nb_name alone -- see that function's docstring for why (a plain
+        f"{nb_name}_*.png" match also catches other notebooks whose name
+        happens to start with nb_name, e.g. "MLD" matching "MLD_max"'s
+        PNGs too). Returns a dict mapping filename → download URL.
         """
         results = {}
         if not os.path.isdir(self.mdfol):
             print(f"[figshare] mdfol not found: {self.mdfol}")
             return results
-        pngs = sorted(
-            f for f in os.listdir(self.mdfol)
-            if f.lower().endswith(".png") and f.startswith(f"{nb_name}_")
-        )
+
+        ofol = os.path.dirname(os.path.normpath(self.mdfol))
+        all_notebook_names = [
+            f[: -len("_rendered.ipynb")]
+            for f in os.listdir(ofol)
+            if f.endswith("_rendered.ipynb")
+        ] if os.path.isdir(ofol) else [nb_name]
+        if nb_name not in all_notebook_names:
+            all_notebook_names.append(nb_name)
+
+        pngs = sorted(assign_pngs_to_notebooks(self.mdfol, all_notebook_names).get(nb_name, []))
         if not pngs:
             print(f"[figshare] No PNG files found for notebook {nb_name} in {self.mdfol}")
             return results
         article_id = self._get_or_create_article()
+        # Capture each file's previously-recorded URL BEFORE _upload_file
+        # overwrites the manifest entry with the new one -- rewrite_markdown
+        # needs this to find and replace an already-embedded (and possibly
+        # now-stale) URL, not just the original local asset path. See
+        # rewrite_markdown's docstring for the full explanation.
+        self._prev_urls_by_fname = {
+            fname: self._manifest.get(f"file_{fname}", {}).get("download_url")
+            for fname in pngs
+        }
         for fname in pngs:
             fpath = os.path.join(self.mdfol, fname)
             url = self._upload_file(article_id, fpath)
@@ -530,13 +690,13 @@ class FigshareUploader:
 
         file_md5 = _md5(nb_path)
         manifest_key = f"notebook_{nb_name}"
-        if manifest_key in self._manifest:
-            cached = self._manifest[manifest_key]
-            if cached.get("md5") == file_md5:
-                print(f"[figshare] Skipping notebook {nb_name} (already uploaded, MD5 matches)")
-                return cached["download_url"]
-            else:
-                print(f"[figshare] MD5 changed for notebook {nb_name}, re-uploading")
+        # No fast-path skip here either -- see _upload_file's docstring for
+        # why. This used to check its own separate notebook_{nb_name}
+        # manifest entry and return early, meaning even fixing
+        # _upload_file's fast path alone would NOT have caught notebooks:
+        # this guard runs first and never reaches _upload_file at all when
+        # it hits. Always delegate through, and let _upload_file's own
+        # (now-live) check decide.
 
         download_url = self._upload_file(article_id, nb_path)
         # Store under the notebook-specific key (upload_file also stores under
@@ -552,6 +712,24 @@ class FigshareUploader:
 
         If *nb_name* is given, rewrites ``<mdfol>/<nb_name>.md``.
         ``url_map`` is a dict mapping PNG filename → figshare download URL.
+
+        THIS WAS THE ROOT CAUSE of a real bug found and worked around
+        externally before being fixed here: this only ever matched the
+        original local asset path. The first time a notebook's markdown
+        gets rewritten that works fine, but on every run after that the
+        local path is already gone from the text (replaced by whatever
+        URL was correct THEN), so the replace found nothing and silently
+        did nothing -- the embedded URL got permanently frozen at
+        whatever it was on the first successful rewrite, even if the
+        underlying Figshare file id changed later (duplicate cleanup, any
+        re-upload) without this notebook being freshly re-executed.
+
+        Fix: also try replacing whatever URL was PREVIOUSLY recorded for
+        this filename (self._prev_urls_by_fname, populated by
+        upload_pngs_for_notebook from the manifest's value BEFORE it gets
+        overwritten this run) -- so a markdown file that's already been
+        through one rewrite can still be correctly updated on any later
+        run, not just the first one.
         """
         stem = nb_name if nb_name else self.experiment
         mdpath = os.path.join(self.mdfol, f"{stem}.md")
@@ -566,9 +744,28 @@ class FigshareUploader:
         with open(mdpath + ".bak", "w") as f:
             f.write(content)
 
+        prev_urls_by_fname = getattr(self, "_prev_urls_by_fname", {})
+
         for fname, url in url_map.items():
             old_pattern = f"/assets/experiments/{self.experiment}/{fname}"
-            content = content.replace(old_pattern, url)
+            if old_pattern in content:
+                # Fresh markdown, never rewritten before.
+                content = content.replace(old_pattern, url)
+                continue
+
+            prev_url = prev_urls_by_fname.get(fname)
+            if prev_url and prev_url != url and prev_url in content:
+                # Already-rewritten markdown from an earlier run -- the
+                # local path is gone, but we know what URL replaced it
+                # last time, so we can find and correct it even though
+                # its value has changed since.
+                content = content.replace(prev_url, url)
+                continue
+
+            # Neither pattern present: this fname genuinely isn't
+            # referenced in this markdown file (fine -- e.g. belongs to
+            # a different notebook), or something unexpected. Leave
+            # content alone rather than guess at what to replace.
 
         with open(mdpath, "w") as f:
             f.write(content)
@@ -581,6 +778,72 @@ class FigshareUploader:
         if article_id:
             return f"https://figshare.com/articles/figure/{article_id}"
         return None
+
+    def validate_and_refresh_notebook_urls(self, article_id, existing_urls):
+        """Check each carried-forward notebook URL against live Figshare
+        state, refreshing any that have gone stale.
+
+        Root cause this addresses: pushit.py's main() merges
+        notebooks_urls.json's existing content with each run's fresh
+        results (``all_notebook_urls = {**existing_urls, **notebook_urls}``).
+        A notebook's entry only updates if that notebook is successfully
+        reprocessed THIS run; anything not touched carries its old value
+        forward indefinitely. If a notebook's file id later changes on
+        Figshare (duplicate cleanup, any re-upload) without that notebook
+        being reprocessed in a later run, its entry silently goes stale
+        and nothing ever corrects it on its own -- the same class of bug
+        as rewrite_markdown's, just via a different mechanism (merge
+        instead of one-shot string replace).
+
+        For each entry, checks whether its URL's file id still exists on
+        Figshare AND is named "<notebook>_rendered.ipynb". If not, looks
+        for the current correct file under that exact name and refreshes
+        the URL -- picking the newest if more than one complete match
+        exists (same convention as _find_remote_file). If NO complete
+        match exists at all, the entry is left AS-IS rather than dropped,
+        so it still shows up as a real, visible failure in
+        --check-figshare-upload instead of silently disappearing from
+        the tracked set.
+
+        *existing_urls* should be pre-filtered by the caller to just the
+        entries NOT already refreshed by this run's own uploads -- no
+        need to re-check something we just uploaded ourselves.
+        """
+        if not existing_urls:
+            return dict(existing_urls)
+
+        all_files = self._list_remote_files(article_id)
+        by_name = {}
+        for f in all_files:
+            by_name.setdefault(f["name"], []).append(f)
+
+        refreshed = dict(existing_urls)
+        for nb, url in existing_urls.items():
+            expected_name = f"{nb}_rendered.ipynb"
+            try:
+                current_id = int(url.rsplit("/", 1)[-1])
+            except ValueError:
+                continue
+
+            matches = by_name.get(expected_name, [])
+            complete = [m for m in matches
+                        if m.get("status") == "available" and m.get("computed_md5")]
+            if any(m["id"] == current_id for m in complete):
+                continue  # still valid
+
+            if not complete:
+                print(f"[figshare] WARNING: notebooks_urls.json entry for '{nb}' "
+                      f"(file {current_id}) appears stale and no replacement was "
+                      f"found on Figshare -- leaving as-is so it shows as a real "
+                      f"failure rather than silently disappearing.")
+                continue
+
+            newest = max(complete, key=lambda m: m["id"])
+            print(f"[figshare] Refreshed stale notebooks_urls.json entry for "
+                  f"'{nb}': file/{current_id} -> file/{newest['id']}")
+            refreshed[nb] = f"https://ndownloader.figshare.com/files/{newest['id']}"
+
+        return refreshed
 
 
 # ---------------------------------------------------------------------------
